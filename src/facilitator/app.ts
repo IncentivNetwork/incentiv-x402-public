@@ -7,13 +7,25 @@ import { IncentivUserOpFacilitatorScheme, type FacilitatorOptions } from "../sch
 import { makeChain } from "../userop.js";
 
 /** A fixed-window counter per client address. */
-class RateLimit {
+export class RateLimit {
   private readonly hits = new Map<string, { count: number; resetAt: number }>();
+  private nextSweep = 0;
   constructor(
     private readonly limit: number,
     private readonly windowMs = 60_000,
-  ) {}
+  ) {
+    if (!Number.isInteger(limit) || limit <= 0) throw new Error(`rate limit must be a positive integer, got ${limit}`);
+  }
+
+  /** Number of client addresses currently tracked. */
+  get size(): number {
+    return this.hits.size;
+  }
   allow(key: string, now = Date.now()): boolean {
+    if (now >= this.nextSweep) {
+      for (const [k, v] of this.hits) if (v.resetAt <= now) this.hits.delete(k);
+      this.nextSweep = now + this.windowMs;
+    }
     const h = this.hits.get(key);
     if (!h || h.resetAt <= now) {
       this.hits.set(key, { count: 1, resetAt: now + this.windowMs });

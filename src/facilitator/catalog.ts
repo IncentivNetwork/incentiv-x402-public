@@ -64,7 +64,9 @@ export class Catalog {
       discoveryInfo?: unknown;
     };
     const url = d.routeTemplate ?? d.resourceUrl;
-    const key = `${d.method ?? "GET"} ${url}`;
+    // The discovery info comes from the payer's payload, so the key includes who was paid: a payment to
+    // another address creates its own entry and can never replace a merchant's listing.
+    const key = `${d.method ?? "GET"} ${url} ${requirements.network} ${requirements.payTo.toLowerCase()}`;
     this.entries.set(key, {
       resource: url,
       type: "http",

@@ -24,7 +24,7 @@ This document specifies two x402 v2 payment schemes for Incentiv mainnet, `incen
 | `asset` | The USDC address above |
 | `amount` | Atomic units. The payment must equal it exactly. |
 | `payTo` | The recipient address |
-| `maxTimeoutSeconds` | Capped at 300 by the resource server; 120 is recommended |
+| `maxTimeoutSeconds` | A positive integer, capped at 300; 120 is recommended. Anything else is `invalid_payment_requirements`. |
 | `extra` | Scheme-specific (sections 3.1 and 4.1) |
 
 ### 2.2 Deadline
@@ -35,7 +35,11 @@ The chain does not enforce the deadline. A signed payment that is never settled 
 
 ### 2.3 One settlement, one claimant
 
-A payment is reported as a success to at most one `/settle` call. A later or concurrent `/settle` for the same payment answers `success: false` with `already_settled` or `already_settling`. This stops one payment from serving several requests that carry the same payload. A settle that ended in `settle_timeout` is not final: retrying the same payload resolves it.
+A payment is reported as a success to at most one `/settle` call. A later or concurrent `/settle` for the same payment answers `success: false` with `already_settled` or `already_settling`. This stops one payment from serving several requests that carry the same payload.
+
+Just before submitting a payment, the facilitator records a **claim** for it in durable storage. A receipt found on chain is reported as a success only when the facilitator holds the claim. Without a claim, the payment was submitted by someone else or its record was lost, and the answer is `already_settled`.
+
+A settle that ended in `settle_timeout` is not final: retrying the same payload resolves it, even after the deadline, because the receipt is looked up before the deadline is checked.
 
 ### 2.4 Order of operations
 
@@ -61,7 +65,7 @@ The payer is an externally owned account. It pays with a signed EIP-1559 transac
 2. `data` is `transfer(payTo, amount)` in canonical ABI encoding.
 3. `gas` is at most 120,000.
 4. `accessList` holds exactly one entry with no storage keys: the deadline marker. Its address is the bytes `78343032` ("x402"), then `validUntil` as a big-endian `uint64`, then 8 zero bytes. Because the access list is signed, so is the deadline.
-5. `nonce` is the sender's next transaction nonce.
+5. `nonce` is the sender's next confirmed nonce. A payer with a pending transaction waits until it is mined; the reference client refuses to sign until then.
 
 The payer is the address recovered from the signature.
 
@@ -84,8 +88,8 @@ Checks run in this order and stop at the first failure.
 
 ### 3.5 Settlement
 
-1. If the transaction already has a receipt, report its outcome.
-2. Otherwise mark the sender busy, repeat checks 7 to 10, and submit it with `eth_sendRawTransaction`.
+1. If the transaction already has a receipt, report its outcome when this facilitator holds the claim (2.3), and `already_settled` otherwise.
+2. Otherwise mark the sender busy, check the deadline, repeat checks 7 to 10, record the claim, and submit it with `eth_sendRawTransaction`.
 3. Wait up to 60 seconds for a receipt.
 
 | Outcome | Response |
@@ -147,8 +151,8 @@ The payer is an Incentiv smart account controlled by an owner EOA. It pays with 
 
 ### 4.5 Settlement
 
-1. If the operation already has a receipt, report its outcome.
-2. Otherwise repeat checks 8 to 13 and submit it with `eth_sendUserOperation`.
+1. If the operation already has a receipt, report its outcome when this facilitator holds the claim (2.3), and `already_settled` otherwise.
+2. Otherwise check the deadline, repeat checks 8 to 13, record the claim, and submit it with `eth_sendUserOperation`.
 3. Wait up to 60 seconds for `eth_getUserOperationReceipt`. Inclusion alone is not success: the receipt's `success` must be true.
 
 | Outcome | Response |
@@ -172,7 +176,7 @@ The payer is an Incentiv smart account controlled by an owner EOA. It pays with 
 - `/verify` and `/settle` answer HTTP 200 for every payment outcome.
   - A request without `paymentPayload` or `paymentRequirements` answers 400.
   - A client over the rate limit answers 429. The defaults are 120 `/verify` and 60 `/settle` calls per minute per address.
-- **Discovery.** A resource is cataloged when a payment for it settles successfully and its payload carries the Bazaar extension. The `/settle` response then carries the `EXTENSION-RESPONSES` header: base64 JSON of `{ "bazaar": { "status": "success" | "rejected", "rejectedReason"? } }`.
+- **Discovery.** A resource is cataloged when a payment for it settles successfully and its payload carries the Bazaar extension. Entries are keyed by method, resource, network and `payTo`, so a payment to another address creates a separate entry and never replaces a merchant's listing. Listings are not verified against the resource's live 402; clients pay what the live 402 asks. The `/settle` response then carries the `EXTENSION-RESPONSES` header: base64 JSON of `{ "bazaar": { "status": "success" | "rejected", "rejectedReason"? } }`.
 
 ## 6. Cancellation
 
@@ -208,7 +212,7 @@ A payer can make an unsettled payment unusable before its deadline passes:
 - **Verify before signing.** Clients must decode what they are about to sign, because `userOpHash` is opaque. The reference clients refuse anything that is not exactly the quoted payment.
 - **No facilitator key.** The facilitator holds no private key. It cannot move funds beyond what payers signed.
 - **Compliance.** TransferGate is checked at `/verify` and `/settle`. For `incentiv-userop` it is also enforced on chain, inside the account.
-- **Single instance.** The single-claimant guarantee (2.3) and `payer_busy` rely on facilitator memory. A facilitator must run as one instance.
+- **Single instance, durable storage.** `payer_busy` and in-flight tracking rely on facilitator memory, and claims (2.3) on its storage. A facilitator must run as one instance with persistent storage.
 - **Untrusted text.** The free text in `PAYMENT-REQUIRED` (`description`, `extra`, `error`) is written by the merchant, and agents must treat it as untrusted.
 
 ## 9. Why not `exact`

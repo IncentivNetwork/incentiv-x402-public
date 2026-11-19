@@ -3,7 +3,7 @@ import type { Server } from "node:http";
 import { x402Client } from "@x402/core/client";
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader } from "@x402/core/http";
 import { wrapFetchWithPayment } from "@x402/fetch";
-import { formatEther, formatUnits, type Address, type Hex } from "viem";
+import { formatEther, formatUnits, keccak256, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   createFacilitatorApp,
@@ -197,7 +197,8 @@ await test("settle timeout, then a retry of the same payload, produces exactly o
   const before = await usdc(merchant);
   const p = await clientScheme.createPaymentPayload(2, requirements);
   const payload = { x402Version: 2, accepted: requirements, payload: p.payload };
-  const impatient = new IncentivEoaTxFacilitatorScheme({ settleTimeoutMs: 1, pollIntervalMs: 1 });
+  // The same store as the facilitator: a timed-out settle leaves a claim that the retry relies on.
+  const impatient = new IncentivEoaTxFacilitatorScheme({ store, settleTimeoutMs: 1, pollIntervalMs: 1 });
   const first = await impatient.settle(payload, requirements);
   assert(!first.success && first.errorReason === "settle_timeout", JSON.stringify(first));
   const second = await post("/settle", { paymentPayload: payload, paymentRequirements: requirements });
@@ -212,6 +213,25 @@ await test("two simultaneous payments from one EOA: exactly one is served", asyn
   const [a, b] = await Promise.allSettled([payingFetch(url), payingFetch(url)]);
   const statuses = [a, b].map((r) => (r.status === "fulfilled" ? r.value.status : 0));
   assert(statuses.filter((s) => s === 200).length === 1, `statuses ${statuses}`);
+  assert((await usdc(merchant)) - before === PRICE, "merchant did not receive exactly one payment");
+});
+
+await test("after the deadline, a payment that executed is reported once, and only by the facilitator that submitted it", async () => {
+  const before = await usdc(merchant);
+  const p = await clientScheme.createPaymentPayload(2, requirements);
+  const payload = { x402Version: 2, accepted: requirements, payload: p.payload };
+  const hash = keccak256((p.payload as { signedTransaction: Hex }).signedTransaction);
+  const first = await new IncentivEoaTxFacilitatorScheme({ store, settleTimeoutMs: 1, pollIntervalMs: 1 }).settle(payload, requirements);
+  assert(first.errorReason === "settle_timeout", JSON.stringify(first));
+  for (let i = 0; i < 60 && !(await chain.client.getTransactionReceipt({ hash }).catch(() => undefined)); i++) await new Promise((r) => setTimeout(r, 2000));
+  const later = () => Date.now() + 10 * 60_000;
+  const stranger = await new IncentivEoaTxFacilitatorScheme({ now: later }).settle(payload, requirements);
+  assert(!stranger.success && stranger.errorReason === "already_settled", `without the claim: ${JSON.stringify(stranger)}`);
+  const claimant = new IncentivEoaTxFacilitatorScheme({ store, now: later });
+  const settled = await claimant.settle(payload, requirements);
+  assert(settled.success === true, `the claimant past the deadline: ${JSON.stringify(settled)}`);
+  const again = await claimant.settle(payload, requirements);
+  assert(!again.success && again.errorReason === "already_settled", JSON.stringify(again));
   assert((await usdc(merchant)) - before === PRICE, "merchant did not receive exactly one payment");
 });
 

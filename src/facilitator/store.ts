@@ -2,35 +2,64 @@ import { existsSync, readFileSync, renameSync, writeFileSync, mkdirSync } from "
 import { dirname } from "node:path";
 import type { SettleResponse } from "@x402/core/types";
 
-/** Remembers settled operations by user operation hash so a retry never pays twice. */
+/**
+ * What the facilitator remembers about payments, by transaction or user operation hash.
+ *
+ * - A **claim** is written just before the facilitator submits a payment. A receipt found later is reported
+ *   as a success only if this facilitator holds the claim, so a payment that was submitted elsewhere, or
+ *   whose record was lost, is never reported as a success for a new request.
+ * - A **result** is the final answer once the payment executed or reverted. A result exists only once.
+ *
+ * Without persistence a restart forgets claims, so a settle that timed out before the restart is then
+ * refused rather than reported twice. Production facilitators must use a persistent store.
+ */
 export interface SettledStore {
-  get(userOpHash: string): SettleResponse | undefined;
-  set(userOpHash: string, result: SettleResponse): void;
+  get(hash: string): SettleResponse | undefined;
+  set(hash: string, result: SettleResponse): void;
+  claim(hash: string): void;
+  isClaimed(hash: string): boolean;
+  release(hash: string): void;
 }
 
 export class MemoryStore implements SettledStore {
-  protected readonly map = new Map<string, SettleResponse>();
+  protected readonly results = new Map<string, SettleResponse>();
+  protected readonly claims = new Set<string>();
   get(hash: string) {
-    return this.map.get(hash.toLowerCase());
+    return this.results.get(hash.toLowerCase());
   }
   set(hash: string, result: SettleResponse) {
-    this.map.set(hash.toLowerCase(), result);
+    this.results.set(hash.toLowerCase(), result);
+    this.claims.delete(hash.toLowerCase());
+    this.save();
   }
+  claim(hash: string) {
+    this.claims.add(hash.toLowerCase());
+    this.save();
+  }
+  isClaimed(hash: string) {
+    return this.claims.has(hash.toLowerCase());
+  }
+  release(hash: string) {
+    if (this.claims.delete(hash.toLowerCase())) this.save();
+  }
+  protected save() {}
 }
 
-/** A JSON file, rewritten atomically on each settlement. Enough for one facilitator process. */
+/** A JSON file, rewritten atomically on each change. Enough for the single facilitator process. */
 export class FileStore extends MemoryStore {
   constructor(private readonly path: string) {
     super();
-    if (existsSync(path)) {
-      for (const [k, v] of Object.entries(JSON.parse(readFileSync(path, "utf8")) as Record<string, SettleResponse>)) this.map.set(k, v);
-    }
+    if (!existsSync(path)) return;
+    const data = JSON.parse(readFileSync(path, "utf8")) as { settled?: Record<string, SettleResponse>; claims?: string[] } & Record<string, unknown>;
+    // Earlier versions stored the results map at the top level.
+    const settled = (data.settled ?? (data.claims ? {} : data)) as Record<string, SettleResponse>;
+    for (const [k, v] of Object.entries(settled)) this.results.set(k, v);
+    for (const k of data.claims ?? []) this.claims.add(k);
   }
-  override set(hash: string, result: SettleResponse) {
-    super.set(hash, result);
+  protected override save() {
     mkdirSync(dirname(this.path), { recursive: true });
     const tmp = `${this.path}.tmp`;
-    writeFileSync(tmp, JSON.stringify(Object.fromEntries(this.map)));
+    writeFileSync(tmp, JSON.stringify({ settled: Object.fromEntries(this.results), claims: [...this.claims] }));
     renameSync(tmp, this.path);
   }
 }

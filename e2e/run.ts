@@ -16,6 +16,7 @@ import {
   SCHEME,
 } from "../src/index.js";
 import { erc20Abi } from "../src/abi.js";
+import { getOpReceipt } from "../src/userop.js";
 import { createMerchant } from "./merchant.js";
 
 const PRICE = 10_000n; // $0.01
@@ -189,7 +190,8 @@ await test("settle timeout, then a retry of the same payload, produces exactly o
   const before = await usdcBalance(merchant);
   const p = await clientScheme.createPaymentPayload(2, requirements);
   const payload = { x402Version: 2, accepted: requirements, payload: p.payload };
-  const impatient = new IncentivUserOpFacilitatorScheme({ settleTimeoutMs: 1, pollIntervalMs: 1 });
+  // The same store as the facilitator: a timed-out settle leaves a claim that the retry relies on.
+  const impatient = new IncentivUserOpFacilitatorScheme({ store, settleTimeoutMs: 1, pollIntervalMs: 1 });
   const first = await impatient.settle(payload, requirements);
   assert(!first.success && first.errorReason === "settle_timeout", JSON.stringify(first));
   const second = await post("/settle", { paymentPayload: payload, paymentRequirements: requirements });
@@ -198,6 +200,25 @@ await test("settle timeout, then a retry of the same payload, produces exactly o
   assert(again.success === false && again.errorReason === "already_settled", `a repeated settle must not succeed again: ${JSON.stringify(again)}`);
   const received = (await usdcBalance(merchant)) - before;
   assert(received === PRICE, `merchant received ${received}, expected exactly ${PRICE}`);
+});
+
+await test("after the deadline, a payment that executed is reported once, and only by the facilitator that submitted it", async () => {
+  const before = await usdcBalance(merchant);
+  const p = await clientScheme.createPaymentPayload(2, requirements);
+  const payload = { x402Version: 2, accepted: requirements, payload: p.payload };
+  const hash = (p.payload as { userOpHash: Hex }).userOpHash;
+  const first = await new IncentivUserOpFacilitatorScheme({ store, settleTimeoutMs: 1, pollIntervalMs: 1 }).settle(payload, requirements);
+  assert(first.errorReason === "settle_timeout", JSON.stringify(first));
+  for (let i = 0; i < 60 && !(await getOpReceipt(chain, hash).catch(() => undefined)); i++) await new Promise((r) => setTimeout(r, 2000));
+  const later = () => Date.now() + 10 * 60_000;
+  const stranger = await new IncentivUserOpFacilitatorScheme({ now: later }).settle(payload, requirements);
+  assert(!stranger.success && stranger.errorReason === "already_settled", `without the claim: ${JSON.stringify(stranger)}`);
+  const claimant = new IncentivUserOpFacilitatorScheme({ store, now: later });
+  const settled = await claimant.settle(payload, requirements);
+  assert(settled.success === true, `the claimant past the deadline: ${JSON.stringify(settled)}`);
+  const again = await claimant.settle(payload, requirements);
+  assert(!again.success && again.errorReason === "already_settled", JSON.stringify(again));
+  assert((await usdcBalance(merchant)) - before === PRICE, "merchant did not receive exactly one payment");
 });
 
 servers.forEach((s) => s.close());

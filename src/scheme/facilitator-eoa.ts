@@ -47,6 +47,7 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
   async verify(payload: PaymentPayload, requirements: PaymentRequirements): Promise<VerifyResponse> {
     try {
       const d = await this.parse(payload, requirements);
+      this.checkDeadline(d, requirements);
       await this.checkChain(d, { rejectSettled: true, rejectBusy: true });
       return { isValid: true, payer: d.sender };
     } catch (e) {
@@ -59,7 +60,16 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
     return { isValid: false, invalidReason: "unexpected_verify_error", invalidMessage: e instanceof Error ? e.message : String(e) };
   }
 
-  /** Checks that need no chain access: scheme, shape, deadline and the quoted payment. */
+  /** The facilitator enforces the deadline; the chain has no validity window. */
+  private checkDeadline(d: DecodedEoaPayment, req: PaymentRequirements): void {
+    const nowSeconds = Math.floor(this.now() / 1000);
+    if (d.validUntil <= nowSeconds) throw new PaymentError("payment_expired", "validUntil has passed");
+    if (d.validUntil > nowSeconds + Math.min(req.maxTimeoutSeconds, MAX_TIMEOUT_SECONDS) + CLOCK_SKEW_SECONDS) {
+      throw new PaymentError("invalid_payment_requirements", "validUntil is further away than maxTimeoutSeconds");
+    }
+  }
+
+  /** Checks that need no chain access: scheme, shape and the quoted payment. The deadline is checked separately. */
   private async parse(payload: PaymentPayload, req: PaymentRequirements): Promise<DecodedEoaPayment> {
     if (payload.x402Version !== 2) throw new PaymentError("invalid_x402_version", "x402 version must be 2");
     if (req.scheme !== EOA_SCHEME || payload.accepted?.scheme !== EOA_SCHEME) throw new PaymentError("invalid_scheme", `scheme must be ${EOA_SCHEME}`);
@@ -69,13 +79,10 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
         throw new PaymentError("invalid_payment_requirements", `accepted.${k} differs from the requirements`);
       }
     }
-    const d = await decodeEoaPayment((payload.payload as Partial<EoaPaymentPayload>)?.signedTransaction, this.cfg.chainId);
-
-    const nowSeconds = Math.floor(this.now() / 1000);
-    if (d.validUntil <= nowSeconds) throw new PaymentError("payment_expired", "validUntil has passed");
-    if (d.validUntil > nowSeconds + Math.min(req.maxTimeoutSeconds, MAX_TIMEOUT_SECONDS) + CLOCK_SKEW_SECONDS) {
-      throw new PaymentError("invalid_payment_requirements", "validUntil is further away than maxTimeoutSeconds");
+    if (!Number.isInteger(req.maxTimeoutSeconds) || req.maxTimeoutSeconds <= 0) {
+      throw new PaymentError("invalid_payment_requirements", "maxTimeoutSeconds must be a positive integer");
     }
+    const d = await decodeEoaPayment((payload.payload as Partial<EoaPaymentPayload>)?.signedTransaction, this.cfg.chainId);
     checkPaysRequirements(d, req);
     return d;
   }
@@ -134,7 +141,7 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
     // is never reported as a success again, or one payment could serve many requests.
     if (this.store.get(key)) return this.fail("already_settled", "this transaction was already settled", d.sender);
     if (this.inflight.has(key)) return this.fail("already_settling", "another request is settling this payment", d.sender);
-    const run = this.settleOnce(d).finally(() => this.inflight.delete(key));
+    const run = this.settleOnce(d, requirements).finally(() => this.inflight.delete(key));
     this.inflight.set(key, run);
     return run;
   }
@@ -151,7 +158,7 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
     }
   }
 
-  private async settleOnce(d: DecodedEoaPayment): Promise<SettleResponse> {
+  private async settleOnce(d: DecodedEoaPayment, req: PaymentRequirements): Promise<SettleResponse> {
     const sender = d.sender.toLowerCase();
     const outcome = (status: "success" | "reverted", hash: Hex): SettleResponse => {
       const r =
@@ -162,23 +169,32 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
       return r;
     };
 
-    // It may already be on chain from an attempt that timed out. The hash commits to the whole transaction.
+    // It may already be on chain from an attempt that timed out. It is reported to this caller only if this
+    // facilitator claimed it before submitting; otherwise it was settled elsewhere, or its record was lost.
     let receipt = await this.receipt(d.txHash);
+    if (receipt && !this.store.isClaimed(d.txHash)) {
+      return this.fail("already_settled", "this transaction is already on chain and was not submitted for this request", d.sender, d.txHash);
+    }
     if (!receipt) {
       if (this.busy.has(sender)) return this.fail("payer_busy", "another payment from this payer is being settled", d.sender);
       this.busy.add(sender);
       try {
         try {
+          this.checkDeadline(d, req);
           await this.checkChain(d, { rejectSettled: false, rejectBusy: false });
         } catch (e) {
           const v = this.invalid(e);
           return this.fail(v.invalidReason ?? "unexpected_settle_error", v.invalidMessage ?? "", d.sender);
         }
+        this.store.claim(d.txHash);
         try {
           await this.chain.client.sendRawTransaction({ serializedTransaction: d.raw as `0x02${string}` });
         } catch (e) {
           const message = e instanceof Error ? e.message : String(e);
-          if (!/already known|known transaction|already in/i.test(message)) return this.fail("tx_rejected", message.split("\n")[0]!, d.sender);
+          if (!/already known|known transaction|already in/i.test(message)) {
+            this.store.release(d.txHash);
+            return this.fail("tx_rejected", message.split("\n")[0]!, d.sender);
+          }
         }
         const deadline = this.now() + this.settleTimeoutMs;
         while (!receipt && this.now() < deadline) {

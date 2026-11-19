@@ -106,7 +106,7 @@ Both clients decode what they are about to sign and refuse anything that is not 
 
 **Fund the smart account on Incentiv only.** Its address has no contract on other chains, so funds sent to it on Ethereum or elsewhere cannot be moved by your key. To bridge in, set it as the recipient in the Incentiv Bridge.
 
-An EOA can have one payment settling at a time. A smart account can have many, because each payment uses its own nonce lane.
+An EOA can have one payment settling at a time, and cannot pay while it has a pending transaction. A smart account can have many payments in flight, because each uses its own nonce lane.
 
 ## Run the facilitator
 
@@ -115,7 +115,7 @@ docker build -t incentiv-x402-facilitator .
 docker run -p 4020:4020 -v x402-data:/data incentiv-x402-facilitator
 ```
 
-It serves `/supported`, `/verify`, `/settle`, `/health`, `/discovery/resources` and `/discovery/search`. It holds no private key. **Run exactly one instance.** Configuration, AWS notes and operations are in [docs/DEPLOY.md](docs/DEPLOY.md).
+It serves `/supported`, `/verify`, `/settle`, `/health`, `/discovery/resources` and `/discovery/search`. It holds no private key. **Run exactly one instance, with persistent storage at `/data`.** Configuration, AWS notes and operations are in [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## Costs
 

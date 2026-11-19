@@ -30,7 +30,7 @@ All settings are environment variables. Defaults are Incentiv mainnet.
 ## AWS notes
 
 - **One task.** Use an ECS service with desired count 1, or a single EC2 instance. Do not autoscale it.
-- **Persistent data.** Mount EFS (or an EBS volume) at `/data`. Without it, the discovery catalog is empty after every restart. Payments stay safe either way, because the chain's own nonce rules stop a replay.
+- **Persistent data (required).** Mount EFS (or an EBS volume) at `/data`. It holds the settled payments, the claims the facilitator records before submitting each payment, and the discovery catalog. Without it, a payment whose settle timed out just before a restart is refused on retry (`already_settled`), so its payer is charged but not served, and the catalog starts empty.
 - **Health check.** `GET /health` returns 200 when the RPC and the bundler both answer, and 503 otherwise. The image has a built-in container health check.
 - **TLS and domain.** Terminate TLS at the load balancer and point `x402.incentiv.io` (or your chosen name) at it. Merchants set this URL as their facilitator.
 - **Shutdown.** On SIGTERM it stops accepting requests and waits up to 70 seconds, because a settle can wait up to 60 seconds for a receipt. Set the ECS stop timeout to at least 75 seconds.

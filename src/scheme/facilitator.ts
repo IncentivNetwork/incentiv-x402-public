@@ -32,7 +32,7 @@ export interface FacilitatorOptions {
   now?: () => number;
 }
 
-type Parsed = Checked;
+type Parsed = Checked & { validUntil: number; maxTimeoutSeconds: number };
 
 interface Checked {
   op: UserOp;
@@ -87,7 +87,17 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
   }
 
   private async check(payload: PaymentPayload, req: PaymentRequirements, opts: { rejectSettled: boolean }): Promise<Checked> {
-    return this.checkChain(this.parse(payload, req), opts);
+    const parsed = this.parse(payload, req);
+    this.checkDeadline(parsed);
+    return this.checkChain(parsed, opts);
+  }
+
+  /** The facilitator enforces the deadline; the chain has no validity window. */
+  private checkDeadline({ validUntil, maxTimeoutSeconds }: { validUntil: number; maxTimeoutSeconds: number }): void {
+    const nowSeconds = Math.floor(this.now() / 1000);
+    if (validUntil <= nowSeconds) throw new PaymentError("payment_expired", "validUntil has passed");
+    const window = Math.min(maxTimeoutSeconds, MAX_TIMEOUT_SECONDS) + CLOCK_SKEW_SECONDS;
+    if (validUntil > nowSeconds + window) throw new PaymentError("invalid_payment_requirements", "validUntil is further away than maxTimeoutSeconds");
   }
 
   /** Checks that need no chain access: scheme, expiry, hash, calldata and the nonce lane. */
@@ -104,6 +114,9 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
     if (typeof req.extra?.entryPoint !== "string" || !isAddressEqual(req.extra.entryPoint as Address, this.cfg.entryPoint)) {
       throw new PaymentError("invalid_payment_requirements", "requirements name an unexpected EntryPoint");
     }
+    if (!Number.isInteger(req.maxTimeoutSeconds) || req.maxTimeoutSeconds <= 0) {
+      throw new PaymentError("invalid_payment_requirements", "maxTimeoutSeconds must be a positive integer");
+    }
 
     // 2. The payload itself.
     const p = payload.payload as Partial<UserOpPaymentPayload>;
@@ -119,11 +132,7 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
     const paymentId = p.paymentId as Hex;
     const validUntil = p.validUntil as number;
 
-    // 3. Expiry. The facilitator enforces it; the chain has no validity window.
-    const nowSeconds = Math.floor(this.now() / 1000);
-    if (validUntil <= nowSeconds) throw new PaymentError("payment_expired", "validUntil has passed");
-    const window = Math.min(req.maxTimeoutSeconds, MAX_TIMEOUT_SECONDS) + CLOCK_SKEW_SECONDS;
-    if (validUntil > nowSeconds + window) throw new PaymentError("invalid_payment_requirements", "validUntil is further away than maxTimeoutSeconds");
+    // 3. Expiry is checked separately (checkDeadline): a settle retry looks for a receipt first.
 
     // 4. The hash the signature covers.
     const userOpHash = computeUserOpHash(op, this.cfg.entryPoint, this.cfg.chainId);
@@ -137,7 +146,7 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
     if (op.nonce >> 64n !== paymentNonceKey(paymentId, validUntil)) {
       throw new PaymentError("invalid_payload", "nonce lane does not match paymentId and validUntil");
     }
-    return { op, userOpHash, decoded, payer: getAddress(op.sender) };
+    return { op, userOpHash, decoded, payer: getAddress(op.sender), validUntil, maxTimeoutSeconds: req.maxTimeoutSeconds };
   }
 
   /** Checks against the chain: replay, signature, funds, TransferGate and simulation. */
@@ -253,7 +262,7 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
   }
 
   private async settleOnce(payload: PaymentPayload, req: PaymentRequirements): Promise<SettleResponse> {
-    let c: Checked;
+    let c: Parsed;
     try {
       c = this.parse(payload, req);
     } catch (e) {
@@ -272,21 +281,30 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
       amount: c.decoded.amount.toString(),
     });
 
-    // The operation may already be on chain from an earlier attempt that timed out.
-    // The hash commits to the whole operation, and it was parsed and matched to the requirements above.
+    // The operation may already be on chain from an earlier attempt that timed out. It is reported to this
+    // caller only if this facilitator claimed it before submitting; otherwise it was settled elsewhere, or its
+    // record was lost, and reporting it again could serve a second request for one payment.
     let receipt = await getOpReceipt(this.chain, c.userOpHash).catch(() => undefined);
+    if (receipt && !this.store.isClaimed(c.userOpHash)) {
+      return this.fail("already_settled", "this operation is already on chain and was not submitted for this request", c.payer, receipt.transactionHash ?? "");
+    }
     if (!receipt) {
       try {
-        c = await this.checkChain(c, { rejectSettled: false });
+        this.checkDeadline(c);
+        c = { ...c, ...(await this.checkChain(c, { rejectSettled: false })) };
       } catch (e) {
         const v = this.invalid(e);
         return this.fail(v.invalidReason ?? "unexpected_settle_error", v.invalidMessage ?? "", c.payer);
       }
+      this.store.claim(c.userOpHash);
       try {
         await sendUserOp(this.chain, c.op);
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
-        if (!/already (known|in)|duplicate|replacement/i.test(message)) return this.fail("userop_rejected", message, c.payer);
+        if (!/already (known|in)|duplicate|replacement/i.test(message)) {
+          this.store.release(c.userOpHash);
+          return this.fail("userop_rejected", message, c.payer);
+        }
       }
     }
     const deadline = this.now() + this.settleTimeoutMs;

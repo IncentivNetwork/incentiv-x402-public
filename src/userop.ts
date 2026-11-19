@@ -155,7 +155,7 @@ export function opFromWire(j: unknown): UserOp {
   };
   const hex = (k: string): Hex => {
     const v = str(k)!;
-    if (!/^0x[0-9a-fA-F]*$/.test(v)) throw new Error(`userOperation.${k} is not hex`);
+    if (!/^0x([0-9a-fA-F]{2})*$/.test(v)) throw new Error(`userOperation.${k} is not even-length hex`);
     return v as Hex;
   };
   const addr = (k: string): Address => {
@@ -163,18 +163,21 @@ export function opFromWire(j: unknown): UserOp {
     if (!/^0x[0-9a-fA-F]{40}$/.test(v)) throw new Error(`userOperation.${k} is not an address`);
     return v as Address;
   };
-  const big = (k: string): bigint => {
+  // Gas limits and fees are packed into 16 bytes each in the EntryPoint's hash; the nonce and preVerificationGas into 32.
+  const big = (k: string, bits = 128): bigint => {
     const v = str(k)!;
-    if (!/^0x[0-9a-fA-F]+$/.test(v)) throw new Error(`userOperation.${k} must be a 0x quantity`);
-    return BigInt(v);
+    if (!/^0x[0-9a-fA-F]{1,64}$/.test(v)) throw new Error(`userOperation.${k} must be a 0x quantity`);
+    const n = BigInt(v);
+    if (n >= 1n << BigInt(bits)) throw new Error(`userOperation.${k} does not fit in ${bits} bits`);
+    return n;
   };
   const op: UserOp = {
     sender: addr("sender"),
-    nonce: big("nonce"),
+    nonce: big("nonce", 256),
     callData: hex("callData"),
     callGasLimit: big("callGasLimit"),
     verificationGasLimit: big("verificationGasLimit"),
-    preVerificationGas: big("preVerificationGas"),
+    preVerificationGas: big("preVerificationGas", 256),
     maxFeePerGas: big("maxFeePerGas"),
     maxPriorityFeePerGas: big("maxPriorityFeePerGas"),
     signature: hex("signature"),
@@ -307,8 +310,11 @@ async function usdcGasAmount(chain: Chain, cfg: PaymasterConfig, requiredCent: b
       })) as readonly [bigint, ...unknown[]]
     )[0];
   let amount = requiredCent === 0n ? 0n : (await quoteIn(requiredCent) * 102n) / 100n;
-  for (let i = 0; i < 5 && amount > 0n; i++) {
+  for (let attempt = 0; requiredCent > 0n; attempt++) {
     if ((await quoteOut(amount)) >= requiredCent) break;
+    if (attempt === 5) {
+      throw new Error("The USDC/WCENT pool cannot quote a gas fee the paymaster would accept; pay gas in CENT instead (gas: \"native\")");
+    }
     amount = (amount * 105n) / 100n;
   }
   return amount < cfg.minPaymentUsdc ? cfg.minPaymentUsdc : amount;

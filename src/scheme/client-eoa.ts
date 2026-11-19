@@ -44,11 +44,17 @@ export class IncentivEoaTxClientScheme implements SchemeNetworkClient {
     const from = this.payer.owner.address;
     const asset = getAddress(requirements.asset);
     const call = transferCall(asset, getAddress(requirements.payTo), BigInt(requirements.amount));
-    const [nonce, estimate, block] = await Promise.all([
+    const [nonce, pending, estimate, block] = await Promise.all([
+      this.chain.client.getTransactionCount({ address: from, blockTag: "latest" }),
       this.chain.client.getTransactionCount({ address: from, blockTag: "pending" }),
       this.chain.client.estimateGas({ account: from, to: asset, data: call.data }),
       this.chain.client.getBlock(),
     ]);
+    // The facilitator accepts only the next confirmed nonce, so a payment signed behind a pending transaction
+    // would be refused as nonce_used. Say so now instead.
+    if (pending !== nonce) {
+      throw new Error(`${from} has ${pending - nonce} pending transaction(s); wait until they are mined before paying`);
+    }
     const gas = (estimate * 120n) / 100n;
     if (gas > MAX_EOA_GAS) throw new Error(`The transfer needs ${gas} gas, above the ${MAX_EOA_GAS} the facilitator accepts`);
     const tip = 1_000_000_000n;

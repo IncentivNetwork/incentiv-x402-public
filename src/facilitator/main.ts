@@ -6,7 +6,17 @@ import { FileStore } from "./store.js";
 
 // Configuration is read from the environment so the same image runs anywhere.
 const env = (name: string) => (process.env[name] === undefined || process.env[name] === "" ? undefined : process.env[name]);
-const port = Number(env("PORT") ?? 4020);
+/** A positive integer setting, or the default; anything else stops the process at startup. */
+const intEnv = (name: string, fallback?: number): number | undefined => {
+  const raw = env(name);
+  if (raw === undefined) return fallback;
+  if (!/^\d+$/.test(raw) || Number(raw) <= 0) {
+    console.error(`${name} must be a positive integer, got "${raw}"`);
+    process.exit(1);
+  }
+  return Number(raw);
+};
+const port = intEnv("PORT", 4020)!;
 const dataDir = env("FACILITATOR_DATA_DIR") ?? join(process.cwd(), "data");
 const config: IncentivConfig = {
   ...MAINNET,
@@ -21,8 +31,8 @@ const { app } = createFacilitatorApp({
   store: new FileStore(join(dataDir, "settled.json")),
   catalog: new Catalog(join(dataDir, "catalog.json")),
   trustProxy: trust === undefined ? undefined : /^\d+$/.test(trust) ? Number(trust) : trust === "true" ? true : trust,
-  verifyPerMinute: env("VERIFY_PER_MINUTE") ? Number(env("VERIFY_PER_MINUTE")) : undefined,
-  settlePerMinute: env("SETTLE_PER_MINUTE") ? Number(env("SETTLE_PER_MINUTE")) : undefined,
+  verifyPerMinute: intEnv("VERIFY_PER_MINUTE"),
+  settlePerMinute: intEnv("SETTLE_PER_MINUTE"),
   log,
 });
 
