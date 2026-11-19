@@ -1,0 +1,89 @@
+{
+  "name": "@incentiv/x402",
+  "version": "0.1.0",
+  "description": "x402 payments on Incentiv: two payment schemes for the stock @x402 packages, and a facilitator service.",
+  "keywords": [
+    "x402",
+    "incentiv",
+    "payments",
+    "erc-4337",
+    "agents",
+    "http-402"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IncentivNetwork/incentiv-x402-public.git"
+  },
+  "homepage": "https://github.com/IncentivNetwork/incentiv-x402-public#readme",
+  "bugs": {
+    "url": "https://github.com/IncentivNetwork/incentiv-x402-public/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/scheme/server.d.ts",
+      "import": "./dist/scheme/server.js"
+    },
+    "./client": {
+      "types": "./dist/scheme/client.d.ts",
+      "import": "./dist/scheme/client.js"
+    },
+    "./facilitator": {
+      "types": "./dist/scheme/facilitator.d.ts",
+      "import": "./dist/scheme/facilitator.js"
+    },
+    "./eoa/server": {
+      "types": "./dist/scheme/server-eoa.d.ts",
+      "import": "./dist/scheme/server-eoa.js"
+    },
+    "./eoa/client": {
+      "types": "./dist/scheme/client-eoa.d.ts",
+      "import": "./dist/scheme/client-eoa.js"
+    },
+    "./eoa/facilitator": {
+      "types": "./dist/scheme/facilitator-eoa.d.ts",
+      "import": "./dist/scheme/facilitator-eoa.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "docs"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "keys": "node --import tsx scripts/gen-keys.ts",
+    "where": "node --import tsx scripts/where.ts",
+    "fund-smart-account": "node --import tsx scripts/fund-smart-account.ts",
+    "facilitator": "node --import tsx src/facilitator/main.ts",
+    "e2e": "node --import tsx e2e/run-eoa.ts",
+    "e2e:userop": "node --import tsx e2e/run.ts",
+    "start": "node dist/facilitator/main.js"
+  },
+  "dependencies": {
+    "@x402/core": "2.31.0",
+    "@x402/express": "2.31.0",
+    "@x402/extensions": "2.31.0",
+    "@x402/fetch": "2.31.0",
+    "express": "^5.1.0",
+    "viem": "2.55.4"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.1",
+    "typescript": "^5.9.0"
+  }
+}
