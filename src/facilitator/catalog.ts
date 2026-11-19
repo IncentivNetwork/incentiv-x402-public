@@ -38,7 +38,15 @@ export class Catalog {
 
   constructor(private readonly path?: string) {
     if (path && existsSync(path)) {
-      for (const [k, v] of Object.entries(JSON.parse(readFileSync(path, "utf8")) as Record<string, DiscoveryEntry>)) this.entries.set(k, v);
+      let dropped = false;
+      for (const [k, v] of Object.entries(JSON.parse(readFileSync(path, "utf8")) as Record<string, DiscoveryEntry>)) {
+        // Listings saved before the key included network and payTo ("GET <url>") are dropped: they cannot be
+        // told apart from a hijacked listing, and the real one is rebuilt by the merchant's next paid request.
+        const a = v.accepts?.[0];
+        if (a && k.endsWith(` ${a.network} ${a.payTo.toLowerCase()}`)) this.entries.set(k, v);
+        else dropped = true;
+      }
+      if (dropped) this.save();
     }
   }
 

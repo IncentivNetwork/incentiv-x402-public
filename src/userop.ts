@@ -309,15 +309,18 @@ async function usdcGasAmount(chain: Chain, cfg: PaymasterConfig, requiredCent: b
         args: [{ tokenIn: cfg.usdcToken, tokenOut: chain.config.wcent, amountIn, fee: cfg.usdcPoolFee, sqrtPriceLimitX96: 0n }],
       })) as readonly [bigint, ...unknown[]]
     )[0];
+  // The paymaster accepts at least minPaymentUsdc, so start from the floor and check that amount.
   let amount = requiredCent === 0n ? 0n : (await quoteIn(requiredCent) * 102n) / 100n;
+  if (amount < cfg.minPaymentUsdc) amount = cfg.minPaymentUsdc;
   for (let attempt = 0; requiredCent > 0n; attempt++) {
     if ((await quoteOut(amount)) >= requiredCent) break;
     if (attempt === 5) {
       throw new Error("The USDC/WCENT pool cannot quote a gas fee the paymaster would accept; pay gas in CENT instead (gas: \"native\")");
     }
-    amount = (amount * 105n) / 100n;
+    const step = amount / 20n; // +5%, and at least 1 so a tiny fee still grows
+    amount += step > 0n ? step : 1n;
   }
-  return amount < cfg.minPaymentUsdc ? cfg.minPaymentUsdc : amount;
+  return amount;
 }
 
 // --- Payment user operation ------------------------------------------------

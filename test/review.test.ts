@@ -96,3 +96,28 @@ test("requirements without a numeric maxTimeoutSeconds are refused before any de
     assert.equal(u.invalidReason, "invalid_payment_requirements", `userop, maxTimeoutSeconds=${maxTimeoutSeconds}`);
   }
 });
+
+test("claims older than an hour are forgotten, and the earlier list format still loads", () => {
+  const dir = mkdtempSync(join(tmpdir(), "x402-claims-"));
+  const path = join(dir, "s.json");
+  writeFileSync(path, JSON.stringify({ settled: {}, claims: { "0xold": Date.now() - 2 * 3_600_000, "0xnew": Date.now() - 60_000 } }));
+  const s = new FileStore(path);
+  assert.equal(s.isClaimed("0xold"), false, "a stale claim is dropped on load");
+  assert.ok(s.isClaimed("0xnew"));
+  writeFileSync(path, JSON.stringify({ settled: {}, claims: ["0xlisted"] }));
+  assert.ok(new FileStore(path).isClaimed("0xlisted"), "a claim from the list format counts as claimed now");
+});
+
+test("a catalog file saved before the key held network and payTo loses those entries and keeps the rest", () => {
+  const dir = mkdtempSync(join(tmpdir(), "x402-catalog-"));
+  const path = join(dir, "catalog.json");
+  const accepts = [{ scheme: "incentiv-eoa-tx", network: "eip155:24101", asset: usdc, amount: "10000", payTo: merchant, maxTimeoutSeconds: 120, extra: {} }];
+  const entry = { resource: "https://api.example.com/weather", type: "http", x402Version: 2, accepts, lastUpdated: "2026-11-19T00:00:00.000Z" };
+  writeFileSync(path, JSON.stringify({
+    "GET https://api.example.com/weather": entry,
+    [`GET https://api.example.com/other eip155:24101 ${merchant.toLowerCase()}`]: { ...entry, resource: "https://api.example.com/other" },
+  }));
+  const c = new Catalog(path);
+  assert.deepEqual(c.list({}).items.map((e) => e.resource), ["https://api.example.com/other"]);
+  assert.equal(Object.keys(JSON.parse(readFileSync(path, "utf8"))).length, 1, "the cleaned file is saved");
+});
