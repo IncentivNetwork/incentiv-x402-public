@@ -2,10 +2,11 @@ import { getAddress, hashMessage, isAddressEqual, recoverAddress, decodeFunction
 import type { Network, PaymentPayload, PaymentRequirements, SchemeNetworkFacilitator, SettleResponse, VerifyResponse } from "@x402/core/types";
 import { accountAbi, accountFactoryAbi, entryPointAbi, erc20Abi, TRANSFER_GATE_REASONS, transferGateAbi } from "../abi.js";
 import { MAINNET, MAX_TIMEOUT_SECONDS, NETWORK, SCHEME, ZERO32, type IncentivConfig } from "../constants.js";
-import { checkPaysRequirements, decodePaymentOp, PaymentError, type DecodedPayment } from "../decode.js";
+import { checkPaysRequirements, checkUsdcPositive, decodePaymentOp, logMessage, logToStderr, PaymentError, publicMessage, type DecodedPayment } from "../decode.js";
 import { MemoryStore, type SettledStore } from "../facilitator/store.js";
 import {
   bundlerRpc,
+  BundlerRpcError,
   centAvailable,
   requiredPrefund,
   computeUserOpHash,
@@ -14,7 +15,10 @@ import {
   opFromWire,
   opToWire,
   paymentNonceKey,
+  refusedOnSubmit,
   sendUserOp,
+  SettleDeadlineError,
+  withDeadline,
   type Chain,
   type UserOp,
 } from "../userop.js";
@@ -30,6 +34,8 @@ export interface FacilitatorOptions {
   settleTimeoutMs?: number;
   pollIntervalMs?: number;
   now?: () => number;
+  /** Receives one JSON-ready record per notable event, including the details of unexpected errors. Default: JSON lines on stderr. */
+  log?: (line: Record<string, unknown>) => void;
 }
 
 type Parsed = Checked & { validUntil: number; maxTimeoutSeconds: number };
@@ -51,6 +57,7 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
   private readonly settleTimeoutMs: number;
   private readonly pollIntervalMs: number;
   private readonly now: () => number;
+  private readonly log: (line: Record<string, unknown>) => void;
   private readonly inflight = new Map<string, Promise<SettleResponse>>();
 
   constructor(options: FacilitatorOptions = {}) {
@@ -60,6 +67,7 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
     this.settleTimeoutMs = options.settleTimeoutMs ?? 60_000;
     this.pollIntervalMs = options.pollIntervalMs ?? 1_000;
     this.now = options.now ?? (() => Date.now());
+    this.log = options.log ?? logToStderr;
   }
 
   getExtra(_network: Network) {
@@ -74,22 +82,41 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
 
   async verify(payload: PaymentPayload, requirements: PaymentRequirements): Promise<VerifyResponse> {
     try {
-      const c = await this.check(payload, requirements, { rejectSettled: true });
-      return { isValid: true, payer: c.payer };
+      const parsed = this.parse(payload, requirements);
+      if (this.store.get(parsed.userOpHash)) throw new PaymentError("already_settled", "this operation was already settled");
+      // An operation this facilitator submitted that executed, but whose settle timed out or could not be
+      // recorded: the chain no longer matches the payload (its nonce is used), so it is valid as is, and the
+      // settle that follows records it and reports it once. That is how a verify-first merchant recovers it.
+      const claimed = this.store.isClaimed(parsed.userOpHash);
+      const receipt = claimed ? await getOpReceipt(this.chain, parsed.userOpHash).catch(() => undefined) : undefined;
+      if (receipt?.success) return { isValid: true, payer: parsed.payer };
+      try {
+        this.checkDeadline(parsed);
+        const c = await this.checkChain(parsed, { rejectSettled: false });
+        return { isValid: true, payer: c.payer };
+      } catch (e) {
+        // Submitted here before and it may still land (queued past its deadline, or bundled but not yet visible):
+        // valid, so a verify-first merchant settles again, and that settle waits for the receipt without
+        // submitting it again.
+        if (claimed && !receipt && e instanceof PaymentError && (await this.mayStillLand(parsed, e.reason, this.now() + this.settleTimeoutMs))) {
+          return { isValid: true, payer: parsed.payer };
+        }
+        throw e;
+      }
     } catch (e) {
       return this.invalid(e);
     }
   }
 
-  private invalid(e: unknown): VerifyResponse {
-    if (e instanceof PaymentError) return { isValid: false, invalidReason: e.reason, invalidMessage: e.message };
-    return { isValid: false, invalidReason: "unexpected_verify_error", invalidMessage: e instanceof Error ? e.message : String(e) };
-  }
-
-  private async check(payload: PaymentPayload, req: PaymentRequirements, opts: { rejectSettled: boolean }): Promise<Checked> {
-    const parsed = this.parse(payload, req);
-    this.checkDeadline(parsed);
-    return this.checkChain(parsed, opts);
+  private invalid(e: unknown, unexpected = "unexpected_verify_error"): VerifyResponse {
+    if (e instanceof PaymentError) {
+      // The client gets the sanitized message; the original error behind it goes to the log.
+      if (e.detail !== undefined) this.log({ event: "payment_error", reason: e.reason, error: logMessage(e.detail) });
+      return { isValid: false, invalidReason: e.reason, invalidMessage: e.message };
+    }
+    // An unexpected error can carry internals (RPC URL, request body); the client gets a generic message.
+    this.log({ event: "unexpected_error", error: logMessage(e) });
+    return { isValid: false, invalidReason: unexpected, invalidMessage: "internal error" };
   }
 
   /** The facilitator enforces the deadline; the chain has no validity window. */
@@ -117,6 +144,7 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
     if (!Number.isInteger(req.maxTimeoutSeconds) || req.maxTimeoutSeconds <= 0) {
       throw new PaymentError("invalid_payment_requirements", "maxTimeoutSeconds must be a positive integer");
     }
+    checkUsdcPositive(req, this.cfg);
 
     // 2. The payload itself.
     const p = payload.payload as Partial<UserOpPaymentPayload>;
@@ -127,7 +155,7 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
     try {
       op = opFromWire(p.userOperation);
     } catch (e) {
-      throw new PaymentError("invalid_payload", e instanceof Error ? e.message : "malformed userOperation");
+      throw new PaymentError("invalid_payload", publicMessage(e));
     }
     const paymentId = p.paymentId as Hex;
     const validUntil = p.validUntil as number;
@@ -187,7 +215,7 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
         });
         reject = Number(r.reject);
       } catch (e) {
-        throw new PaymentError("transfer_gate_unavailable", `TransferGate check failed: ${e instanceof Error ? e.message : e}`);
+        throw new PaymentError("transfer_gate_unavailable", `TransferGate check failed: ${publicMessage(e)}`, e);
       }
       if (reject !== 0) {
         const name = TRANSFER_GATE_REASONS[reject] ?? `UNKNOWN(${reject})`;
@@ -199,7 +227,7 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
     try {
       await bundlerRpc(this.chain, "eth_estimateUserOperationGas", [opToWire(op), this.cfg.entryPoint]);
     } catch (e) {
-      throw new PaymentError("simulation_failed", e instanceof Error ? e.message : String(e));
+      throw new PaymentError("simulation_failed", publicMessage(e, 1_000), e);
     }
 
     return { op, userOpHash, decoded, payer };
@@ -257,20 +285,99 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
     return run;
   }
 
+  /** The full revert reason goes to the log; the response carries it cleaned and capped. */
+  private revertReason(hash: string, reason: string): string {
+    this.log({ event: "userop_reverted", hash, reason: logMessage(reason) });
+    return publicMessage(reason, 1_000);
+  }
+
+  /** A claim that cannot be released only lingers until CLAIM_TTL_MS; that is never worth failing a request. */
+  private releaseClaim(hash: string) {
+    try {
+      this.store.release(hash);
+    } catch (e) {
+      this.log({ event: "store_error", hash, error: logMessage(e) });
+    }
+  }
+
   private fail(reason: string, message: string, payer?: Address, transaction = ""): SettleResponse {
     return { success: false, errorReason: reason, errorMessage: message, payer, transaction, network: NETWORK };
   }
 
+  /**
+   * Whether the bundler holds this operation, queued or included (`eth_getUserOperationByHash`). Only an explicit
+   * `null` result is absence. An error, including a bundler without the method, or an answer without a result, is
+   * undefined: the operation may still be queued.
+   */
+  private async opKnown(hash: Hex): Promise<boolean | undefined> {
+    try {
+      const found = await bundlerRpc(this.chain, "eth_getUserOperationByHash", [hash]);
+      if (found === null) return false;
+      return typeof found === "object" ? true : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Whether a claimed operation whose checks failed with `reason` may still land, so the answer must stay
+   * retryable: its nonce is used (bundled, not yet visible to the receipt lookup), or its deadline passed (the
+   * facilitator enforces it, the chain does not) and neither the bundler nor the chain shows it absent.
+   */
+  private async mayStillLand(c: Parsed, reason: string, deadline: number): Promise<boolean> {
+    if (!this.store.isClaimed(c.userOpHash)) return false;
+    if (reason === "nonce_used") return true;
+    if (reason !== "payment_expired") return false;
+    const absent =
+      (await this.within(deadline, () => this.opKnown(c.userOpHash))) === false && (await this.within(deadline, () => this.nonceUsed(c.op))) === false;
+    return !absent;
+  }
+
+  /** Whether the operation's nonce has been used on chain; undefined if the RPC cannot say. */
+  private async nonceUsed(op: UserOp): Promise<boolean | undefined> {
+    try {
+      const current = await this.chain.client.readContract({ address: this.cfg.entryPoint, abi: entryPointAbi, functionName: "getNonce", args: [op.sender, op.nonce >> 64n] });
+      return current > op.nonce;
+    } catch {
+      return undefined;
+    }
+  }
+
+
+  /**
+   * Runs a chain read within the settle deadline: undefined if it fails or has not answered by then. Every read in
+   * a settle goes through this, so a settle never runs past its window.
+   */
+  private async within<T>(deadline: number, read: () => Promise<T>): Promise<T | undefined> {
+    const left = deadline - this.now();
+    if (left <= 0) return undefined;
+    return withDeadline(read(), left).catch(() => undefined);
+  }
+
+  /** Waits one poll interval, or less if the deadline comes first. */
+  private pause(deadline: number) {
+    return new Promise((r) => setTimeout(r, Math.max(0, Math.min(this.pollIntervalMs, deadline - this.now()))));
+  }
+
   private async settleOnce(payload: PaymentPayload, req: PaymentRequirements): Promise<SettleResponse> {
+    // The whole settle, lookups, checks and submission included, fits in one window.
+    const deadline = this.now() + this.settleTimeoutMs;
     let c: Parsed;
     try {
       c = this.parse(payload, req);
     } catch (e) {
-      const v = this.invalid(e);
+      const v = this.invalid(e, "unexpected_settle_error");
       return this.fail(v.invalidReason ?? "unexpected_settle_error", v.invalidMessage ?? "", undefined);
     }
+    // A success is reported only once it is durably recorded, so one payment is never a success twice (SPEC 2.3).
+    // If the write fails, the claim stays and resending the same payload records and reports it once storage works.
     const remember = (r: SettleResponse) => {
-      this.store.set(c.userOpHash, r);
+      try {
+        this.store.set(c.userOpHash, r);
+      } catch (e) {
+        this.log({ event: "store_error", hash: c.userOpHash, error: logMessage(e) });
+        if (r.success) return this.fail("settle_unrecorded", "the payment executed but could not be recorded; resend the same payload", c.payer, r.transaction);
+      }
       return r;
     };
     const succeeded = (transaction: string | undefined): SettleResponse => ({
@@ -284,38 +391,79 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
     // The operation may already be on chain from an earlier attempt that timed out. It is reported to this
     // caller only if this facilitator claimed it before submitting; otherwise it was settled elsewhere, or its
     // record was lost, and reporting it again could serve a second request for one payment.
-    let receipt = await getOpReceipt(this.chain, c.userOpHash).catch(() => undefined);
+    const lookUp = () => getOpReceipt(this.chain, c.userOpHash);
+    let receipt = await this.within(deadline, lookUp);
     if (receipt && !this.store.isClaimed(c.userOpHash)) {
       return this.fail("already_settled", "this operation is already on chain and was not submitted for this request", c.payer, receipt.transactionHash ?? "");
     }
+    // The answer when no receipt shows up in time. While this facilitator holds the claim, a retry can still find
+    // the receipt, so that answer is always settle_timeout.
+    const noReceipt = this.fail("settle_timeout", "no receipt within the settle window; resend the same payload", c.payer);
     if (!receipt) {
+      let submit = true;
       try {
         this.checkDeadline(c);
-        c = { ...c, ...(await this.checkChain(c, { rejectSettled: false })) };
+        c = { ...c, ...(await withDeadline(this.checkChain(c, { rejectSettled: false }), deadline - this.now())) };
       } catch (e) {
-        const v = this.invalid(e);
-        return this.fail(v.invalidReason ?? "unexpected_settle_error", v.invalidMessage ?? "", c.payer);
+        if (e instanceof SettleDeadlineError) {
+          this.log({ event: "settle_checks_timeout", hash: c.userOpHash });
+          return this.fail("settle_timeout", "the checks did not finish within the settle window; nothing was submitted; resend the same payload", c.payer);
+        }
+        const v = this.invalid(e, "unexpected_settle_error");
+        // Submitted here before and it may still land: wait for the receipt instead of failing, and never submit it
+        // again (past its deadline, or with its nonce used).
+        if (!(await this.mayStillLand(c, v.invalidReason ?? "", deadline))) return this.fail(v.invalidReason ?? "unexpected_settle_error", v.invalidMessage ?? "", c.payer);
+        submit = false;
       }
-      this.store.claim(c.userOpHash);
-      try {
-        await sendUserOp(this.chain, c.op);
-      } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        if (!/already (known|in)|duplicate|replacement/i.test(message)) {
-          this.store.release(c.userOpHash);
-          return this.fail("userop_rejected", message, c.payer);
+      if (submit) {
+        // Whether an earlier settle submitted it and lost the answer: a copy of it may then still be queued.
+        const claimedBefore = this.store.isClaimed(c.userOpHash);
+        try {
+          this.store.claim(c.userOpHash);
+        } catch (e) {
+          this.log({ event: "store_error", hash: c.userOpHash, error: logMessage(e) });
+          return this.fail("store_unavailable", "the facilitator cannot record payments right now; nothing was submitted", c.payer);
+        }
+        try {
+          await withDeadline(sendUserOp(this.chain, c.op), deadline - this.now());
+        } catch (e) {
+          const message = e instanceof Error ? e.message : String(e);
+          if (/already (known|in)|duplicate|replacement/i.test(message)) {
+            // Submitted before: wait for its receipt.
+          } else if (refusedOnSubmit(e)) {
+            // A refusal is final only if neither the chain nor the bundler shows this operation: a bundler can
+            // refuse a resend because the first copy landed, or because it is still queued (getNonce does not see
+            // the queue, and not every bundler words a duplicate in a way the check above recognizes).
+            receipt = await this.within(deadline, lookUp);
+            // Held by the bundler: the claim is kept. Absent: the nonce decides. Unknown (the lookup failed, or the
+            // bundler lacks the method): the claim is kept if an earlier settle submitted a copy that may be queued;
+            // on a first submission there is no earlier copy, so the nonce decides.
+            const held = receipt ? true : await this.within(deadline, () => this.opKnown(c.userOpHash));
+            const used =
+              held === true ? true : held === false || !claimedBefore ? await this.within(deadline, () => this.nonceUsed(c.op)) : undefined;
+            if (used === false) {
+              this.releaseClaim(c.userOpHash);
+              this.log({ event: "payment_error", reason: "userop_rejected", error: logMessage(e) });
+              return this.fail("userop_rejected", publicMessage(e, 1_000), c.payer);
+            }
+            // The operation is queued, or its nonce is used (by it, or another from the same account), or the RPC cannot say.
+            this.log({ event: "submit_unknown", hash: c.userOpHash, error: logMessage(e) });
+          } else {
+            // No answer (a lost connection, a timeout, a 5xx status): the bundler may have accepted it. The claim
+            // stays and the receipt decides; a settle_timeout is retried with the same payload and reconciles it.
+            this.log({ event: "submit_unknown", hash: c.userOpHash, error: logMessage(e) });
+          }
         }
       }
     }
-    const deadline = this.now() + this.settleTimeoutMs;
     while (!receipt && this.now() < deadline) {
-      await new Promise((r) => setTimeout(r, this.pollIntervalMs));
-      receipt = await getOpReceipt(this.chain, c.userOpHash).catch(() => undefined);
+      await this.pause(deadline);
+      receipt = await this.within(deadline, lookUp);
     }
-    if (!receipt) return this.fail("settle_timeout", "no receipt within the settle window; resend the same payload", c.payer);
+    if (!receipt) return noReceipt;
 
     if (!receipt.success) {
-      return remember(this.fail("userop_reverted", receipt.reason ?? "the operation reverted on chain", c.payer, receipt.transactionHash ?? ""));
+      return remember(this.fail("userop_reverted", receipt.reason ? this.revertReason(c.userOpHash, receipt.reason) : "the operation reverted on chain", c.payer, receipt.transactionHash ?? ""));
     }
     return remember(succeeded(receipt.transactionHash));
   }

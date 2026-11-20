@@ -1,5 +1,6 @@
+# node:24-slim, pinned by digest (2026-11-11). Update both lines together.
 # Build
-FROM node:24-slim AS build
+FROM node:24-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS build
 WORKDIR /app
 COPY package.json package-lock.json tsconfig.json tsconfig.build.json ./
 RUN npm ci --ignore-scripts
@@ -7,7 +8,7 @@ COPY src ./src
 RUN npm run build
 
 # Run
-FROM node:24-slim
+FROM node:24-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54
 ENV NODE_ENV=production PORT=4020 FACILITATOR_DATA_DIR=/data
 WORKDIR /app
 COPY package.json package-lock.json ./

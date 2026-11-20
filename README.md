@@ -95,7 +95,7 @@ client.register("eip155:24101", scheme);
 console.log(await scheme.account()); // the smart account that pays
 ```
 
-Both clients decode what they are about to sign and refuse anything that is not exactly the quoted payment.
+Both clients decode what they are about to sign and refuse anything that is not exactly the quoted payment. With `gas: "token"`, the smart-account client also refuses a gas fee above `maxGasFee` (USDC atomic units, default `250_000n`, 0.25 USDC), and refuses to pay gas in any token other than USDC. With `gas: "native"`, it refuses an operation that may cost more than `maxNativeGasCost` in CENT (wei, default 100 CENT, exported as `DEFAULT_MAX_NATIVE_GAS_COST`).
 
 ### Funding a payer
 

@@ -1,12 +1,15 @@
 import {
+  BaseError,
   concatHex,
   createPublicClient,
   encodeAbiParameters,
   encodeFunctionData,
   http,
+  HttpRequestError,
   keccak256,
   numberToHex,
   pad,
+  RpcRequestError,
   toHex,
   type Address,
   type Hex,
@@ -24,11 +27,20 @@ export interface Chain {
   client: PublicClient;
 }
 
+/** viem sends `eth_sendRawTransaction` once (`retryCount: 0`); its reads are retried as configured here. */
 export function makeChain(config: IncentivConfig = MAINNET): Chain {
   const client = createPublicClient({
     transport: http(config.rpcUrl, { timeout: 20_000, fetchOptions: { headers: { "User-Agent": USER_AGENT } } }),
   });
   return { config, client };
+}
+
+/**
+ * A refusal about the nonce: the transaction, or another one from the same sender, may already be on chain or in
+ * a node's mempool. Such a refusal never proves the payment will not land.
+ */
+export function nonceRefusal(message: string): boolean {
+  return /nonce too low|nonce has already been used|old ?nonce|nonce.*(too small|already)|replacement transaction underpriced|already imported/i.test(message);
 }
 
 export interface Call {
@@ -197,6 +209,79 @@ export function opFromWire(j: unknown): UserOp {
 
 // --- Bundler ---------------------------------------------------------------
 
+/** A JSON-RPC error the bundler answered with: it received the request and refused it. */
+export class BundlerRpcError extends Error {
+  constructor(
+    readonly code: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * The bundler answered with an HTTP error status: a 408 or any 5xx (a proxy can answer one after the bundler
+ * accepted the request, whatever its body says), or another 4xx without a JSON-RPC error.
+ */
+export class BundlerHttpError extends Error {
+  constructor(
+    readonly status: number,
+    detail?: string,
+  ) {
+    super(`Bundler HTTP ${status}${detail ? `: ${detail}` : ""}`);
+  }
+}
+
+/**
+ * RPC answers about the node rather than the payment (forbidden, timeout, too large, rate limited, unknown,
+ * limit exceeded, internal error), the ones viem treats as transient. The node did not judge the payment, so they
+ * are not refusals: the claim is kept and a retry decides.
+ */
+const RPC_TRANSIENT_STATUSES = new Set([403, 408, 413, 429]);
+const RPC_TRANSIENT_CODES = new Set([-1, -32005, -32603, 429]);
+
+/**
+ * Whether a submission was definitely refused.
+ *
+ * - The bundler client sends once: a JSON-RPC error other than an internal error (`-32603`), or an HTTP 4xx status
+ *   other than 408, is a refusal.
+ * - From the RPC, a JSON-RPC error or a 4xx status counts unless it is transient (see RPC_TRANSIENT_*).
+ *
+ * A lost connection, a timeout and a 5xx status say nothing about whether the payment was accepted, so it may
+ * still land. Even a refusal of this request is not always a refusal of the payment: a settle retried after
+ * settle_timeout sends it again, and that resend can be refused ("nonce too low") because the first copy landed or
+ * is pending. Callers decide what a refusal means for the claim.
+ */
+export function refusedOnSubmit(e: unknown): boolean {
+  const answered = (x: unknown) =>
+    (x instanceof BundlerRpcError && x.code !== -32603) ||
+    (x instanceof BundlerHttpError && x.status >= 400 && x.status < 500 && x.status !== 408) ||
+    (x instanceof RpcRequestError && !RPC_TRANSIENT_CODES.has(x.code)) ||
+    (x instanceof HttpRequestError && x.status !== undefined && x.status >= 400 && x.status < 500 && !RPC_TRANSIENT_STATUSES.has(x.status));
+  return answered(e) || (e instanceof BaseError && e.walk(answered) !== null);
+}
+
+/** Thrown by `withDeadline` when a step of a settle did not finish before the settle deadline. */
+export class SettleDeadlineError extends Error {
+  constructor() {
+    super("no answer before the settle deadline");
+  }
+}
+
+/**
+ * Waits for `p` until `ms` have passed, then gives up with `SettleDeadlineError`. The work itself is not
+ * cancelled, so its later answer, or error, is ignored.
+ */
+export async function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  p.catch(() => {});
+  try {
+    return await Promise.race([p, new Promise<never>((_, reject) => (timer = setTimeout(() => reject(new SettleDeadlineError()), Math.max(0, ms))))]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function bundlerRpc(chain: Chain, method: string, params: unknown[]): Promise<unknown> {
   const res = await fetch(chain.config.bundlerUrl, {
     method: "POST",
@@ -204,12 +289,25 @@ export async function bundlerRpc(chain: Chain, method: string, params: unknown[]
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
     signal: AbortSignal.timeout(30_000),
   });
-  if (!res.ok) throw new Error(`Bundler HTTP ${res.status}`);
-  const body = (await res.json()) as { result?: unknown; error?: { code: number; message: string; data?: unknown } };
-  if (body.error) {
-    const data = body.error.data ? ` ${JSON.stringify(body.error.data)}` : "";
-    throw new Error(`Bundler error ${body.error.code}: ${body.error.message}${data}`);
+  // A JSON-RPC error is read with a 2xx or 4xx status: some bundlers send their refusals with a 4xx status. A 408 or
+  // 5xx status says nothing certain about the request, so it stays an HTTP error, with the body's message as detail.
+  const text = await res.text();
+  let body: { result?: unknown; error?: { code: number; message: string; data?: unknown } } | undefined;
+  try {
+    body = JSON.parse(text) as typeof body;
+  } catch {
+    body = undefined;
   }
+  // Any error member is an error, even a malformed one; a code that is not a number is kept as NaN.
+  if (body?.error !== undefined && body?.error !== null) {
+    const { code, message, data } = body.error as { code?: unknown; message?: unknown; data?: unknown };
+    const extra = data ? ` ${JSON.stringify(data)}` : "";
+    const text = `Bundler error ${String(code)}: ${String(message)}${extra}`;
+    if (res.status >= 500 || res.status === 408) throw new BundlerHttpError(res.status, text);
+    throw new BundlerRpcError(typeof code === "number" ? code : NaN, text);
+  }
+  if (!res.ok) throw new BundlerHttpError(res.status);
+  if (typeof body !== "object" || body === null) throw new Error("Bundler answered with invalid JSON");
   return body.result;
 }
 

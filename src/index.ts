@@ -1,6 +1,6 @@
 export * from "./constants.js";
 export { IncentivUserOpScheme, toAtomic } from "./scheme/server.js";
-export { IncentivUserOpClientScheme, type IncentivPayer, type UserOpPaymentPayload } from "./scheme/client.js";
+export { DEFAULT_MAX_GAS_FEE, DEFAULT_MAX_NATIVE_GAS_COST, IncentivUserOpClientScheme, type IncentivPayer, type UserOpPaymentPayload } from "./scheme/client.js";
 export { IncentivUserOpFacilitatorScheme, type FacilitatorOptions } from "./scheme/facilitator.js";
 export { createFacilitatorApp } from "./facilitator/app.js";
 export { FileStore, MemoryStore, type SettledStore } from "./facilitator/store.js";

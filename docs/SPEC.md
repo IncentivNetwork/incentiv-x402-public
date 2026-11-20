@@ -21,8 +21,8 @@ This document specifies two x402 v2 payment schemes for Incentiv mainnet, `incen
 | --- | --- |
 | `scheme` | `incentiv-eoa-tx` or `incentiv-userop` |
 | `network` | `eip155:24101` |
-| `asset` | The USDC address above |
-| `amount` | Atomic units. The payment must equal it exactly. |
+| `asset` | The USDC address above. Any other asset is `asset_mismatch`. |
+| `amount` | Atomic units, at least 1. The payment must equal it exactly. Anything else is `invalid_payment_requirements`. |
 | `payTo` | The recipient address |
 | `maxTimeoutSeconds` | A positive integer, capped at 300; 120 is recommended. Anything else is `invalid_payment_requirements`. |
 | `extra` | Scheme-specific (sections 3.1 and 4.1) |
@@ -39,7 +39,13 @@ A payment is reported as a success to at most one `/settle` call. A later or con
 
 Just before submitting a payment, the facilitator records a **claim** for it in durable storage. A receipt found on chain is reported as a success only when the facilitator holds the claim. Without a claim, the payment was submitted by someone else or its record was lost, and the answer is `already_settled`.
 
-A settle that ended in `settle_timeout` is not final: retrying the same payload resolves it, even after the deadline, because the receipt is looked up before the deadline is checked.
+A settle that ended in `settle_timeout` is not final: retrying the same payload resolves it, even after the deadline, because the receipt is looked up before the deadline is checked. If the retry finds no receipt but the facilitator holds the claim and the payment's nonce is used (the chain checks answer `nonce_used`), the payment may have landed without being visible to the receipt lookup yet. The same holds for `payment_expired` while the payment may still land, because the facilitator enforces the deadline and the chain does not: it is final only when the chain shows the nonce unused (for an EOA transfer, pending transactions included) and, for a user operation, the bundler does not hold it. The facilitator then waits for the receipt for the settle window instead, and without one answers `settle_timeout`, because a later retry can still find it. (A payer who spent the nonce on another transaction therefore costs the merchant retries until the claim expires after 1 hour.)
+
+The claim is released only when the RPC or bundler definitely refused the payment **and** the chain shows neither a receipt for the payment nor its nonce used (for an EOA transfer, counting the node's pending transactions; for a user operation, the bundler must not report it either, queued or included, through `eth_getUserOperationByHash`, where only an explicit `null` result means it does not; when the lookup gives no such answer (an error, a bundler without the method, an answer without a result) and an earlier settle already submitted the operation, the claim is kept, since that copy may still be queued). A definite refusal is a JSON-RPC error other than an internal error (`-32603`) sent with a 2xx or 4xx status other than 408, or an HTTP 4xx status other than 408; a 408 or 5xx status is never a refusal, whatever its body says. From the RPC, answers about the node rather than the payment (HTTP 403, 408, 413, 429 and 5xx; JSON-RPC `-1`, `-32005`, `429` and `-32603`) are not refusals. A payment is sent once per settle, but a settle retried after `settle_timeout` sends it again, and that resend can be refused because the first copy landed or is still pending. So for an EOA transfer, a nonce refusal (`nonce too low` and similar wordings), or any refusal of a resend after an earlier settle submitted the payment, keeps the claim without relying on a read: behind a load-balanced RPC, the receipt and nonce reads can reach a node that has not seen the payment yet. A payment kept this way that never lands is answered `payment_expired` once its deadline has passed and its nonce reads unused; if another transaction from the payer used the nonce, the answer stays `settle_timeout` until the claim expires after 1 hour. If the nonce is used without a receipt, the claim is kept, the receipt is awaited, and the answer without one is `settle_timeout`. If the submission got no answer (a lost connection, a timeout, a 5xx status or an internal error), the payment may have been accepted. The claim is kept, the facilitator waits for the receipt as usual, and a `settle_timeout` is retried with the same payload. If the payment did land, the retry reports it once. If it did not, the retry submits it again.
+
+A settle takes at most the settle window (60 seconds), from its first receipt lookup to its answer: every lookup, check, submission and poll is bounded by it. Checks that have not finished by the end of the window answer `settle_timeout` with nothing submitted, and a submission that has not answered by then counts as no answer.
+
+A success is reported only after it is durably recorded. If storage fails after the payment executed, the answer is `settle_unrecorded`; the claim is kept for 7 days (as long as a result) instead of 1 hour, and retrying the same payload reports the success once storage works. (A restart before storage works loses that extension, and the 1-hour claim limit applies again.) A failure that cannot be recorded (`tx_reverted`, `userop_reverted`) is answered as is and its claim keeps the 1-hour limit. Because the payment's nonce is used by then, `/verify` accepts a payload whose claim this facilitator holds and whose payment executed successfully, skipping the chain checks, and also one whose claim it holds and that may still land by the rules above (no receipt yet, and its nonce used, or its deadline passed without the payment shown absent); the settle that follows waits for the receipt and never submits it again, so a merchant that verifies before every settle can retry it too (the same applies after `settle_timeout`). If the claim itself cannot be recorded, the answer is `store_unavailable` and nothing is submitted.
 
 ### 2.4 Order of operations
 
@@ -90,13 +96,16 @@ Checks run in this order and stop at the first failure.
 
 1. If the transaction already has a receipt, report its outcome when this facilitator holds the claim (2.3), and `already_settled` otherwise.
 2. Otherwise mark the sender busy, check the deadline, repeat checks 7 to 10, record the claim, and submit it with `eth_sendRawTransaction`.
-3. Wait up to 60 seconds for a receipt.
+3. Wait for a receipt until 60 seconds after step 1 started.
 
 | Outcome | Response |
 | --- | --- |
 | Receipt with status success | `success: true`, `transaction` = the transaction hash, `payer`, `amount` |
 | Receipt with status reverted | `success: false`, `tx_reverted` |
-| The RPC rejects the transaction | `success: false`, `tx_rejected` |
+| The RPC refuses the transaction (a JSON-RPC error, or a 4xx status, that is not transient; 2.3) on its first submission, not for its nonce, and the chain shows neither its receipt nor its nonce used, pending included | `success: false`, `tx_rejected`; the claim is released |
+| The RPC refuses it, but its receipt exists | The receipt is reported as above |
+| The RPC refuses it for its nonce, or refuses a resend after an earlier settle submitted it, or the sender's nonce is used or pending, without a receipt | The claim is kept and the receipt is awaited; without one, `settle_timeout` |
+| No answer to the submission (2.3) | The claim is kept and the receipt is awaited as above |
 | No receipt within 60 seconds | `success: false`, `settle_timeout` |
 
 ## 4. Scheme `incentiv-userop`
@@ -153,13 +162,16 @@ The payer is an Incentiv smart account controlled by an owner EOA. It pays with 
 
 1. If the operation already has a receipt, report its outcome when this facilitator holds the claim (2.3), and `already_settled` otherwise.
 2. Otherwise check the deadline, repeat checks 8 to 13, record the claim, and submit it with `eth_sendUserOperation`.
-3. Wait up to 60 seconds for `eth_getUserOperationReceipt`. Inclusion alone is not success: the receipt's `success` must be true.
+3. Wait for `eth_getUserOperationReceipt` until 60 seconds after step 1 started. Inclusion alone is not success: the receipt's `success` must be true.
 
 | Outcome | Response |
 | --- | --- |
 | Receipt with `success: true` | `success: true`, `transaction` = the bundle transaction hash, `payer` = the account, `amount` |
 | Receipt with `success: false` | `success: false`, `userop_reverted` |
-| The bundler rejects the operation | `success: false`, `userop_rejected` |
+| The bundler refuses the operation (a JSON-RPC error, with any HTTP status, or a 4xx status), does not hold it, and the chain shows neither its receipt nor its nonce used | `success: false`, `userop_rejected`; the claim is released |
+| The bundler refuses it, but its receipt exists | The receipt is reported as above |
+| The bundler refuses it, but still holds it (`eth_getUserOperationByHash`), or the account's nonce is used, without a receipt | The claim is kept and the receipt is awaited; without one, `settle_timeout` |
+| No answer to the submission (2.3) | The claim is kept and the receipt is awaited as above |
 | No receipt within 60 seconds | `success: false`, `settle_timeout` |
 
 ## 5. Facilitator HTTP API
@@ -174,9 +186,9 @@ The payer is an Incentiv smart account controlled by an owner EOA. It pays with 
 | `GET /discovery/search` | `query`, plus the same filters and `limit` | `{ x402Version: 2, resources, partialResults, pagination: null }` |
 
 - `/verify` and `/settle` answer HTTP 200 for every payment outcome.
-  - A request without `paymentPayload` or `paymentRequirements` answers 400.
-  - A client over the rate limit answers 429. The defaults are 120 `/verify` and 60 `/settle` calls per minute per address.
-- **Discovery.** A resource is cataloged when a payment for it settles successfully and its payload carries the Bazaar extension. Entries are keyed by method, resource, network and `payTo`, so a payment to another address creates a separate entry and never replaces a merchant's listing. Listings are not verified against the resource's live 402; clients pay what the live 402 asks. The `/settle` response then carries the `EXTENSION-RESPONSES` header: base64 JSON of `{ "bazaar": { "status": "success" | "rejected", "rejectedReason"? } }`.
+  - A request without `paymentPayload` or `paymentRequirements` answers 400 `invalid_request`. A scheme, network or x402 version the facilitator does not serve answers 400 `unsupported_scheme`.
+  - A client over the rate limit answers 429. The defaults are 120 `/verify`, 60 `/settle` and 120 `/discovery/*` calls per minute per address.
+- **Discovery.** A resource is cataloged when a payment for it settles successfully and its payload carries the Bazaar extension. Entries are keyed by method, resource, network and `payTo`, so a payment to another address creates a separate entry. Listings are not authenticated: the details of an entry (description, schema, listed price) come from whoever pays. Each version of those details is scored by the USDC paid for it, halving every 24 hours, and the best-scored version is served (a tie keeps the one served; self-payments score nothing). Versions are compared with object keys in a fixed order (every key counts, `__proto__` included) and addresses lowercased, so the same declaration with its keys reordered, or an address in another casing, is the same version; the served values are kept as paid. How a sale was paid (`scheme`, `extra` and `maxTimeoutSeconds`) is not part of a version, so a route that offers both schemes is one listing, even with a different timeout per scheme. Its `accepts` lists one item per scheme the version was paid with in the last 7 days, each with its own `extra` and timeout and the latest sale's first, so a `scheme` filter finds the route whichever scheme was used last; a scheme not paid for 7 days is dropped at the next sale. `extra` keeps only the fields a scheme defines (`entryPoint` for `incentiv-userop`). The listed price is part of a version, so a route whose price changes from request to request has competing versions, and the less paid prices are answered `rejected`. A dynamic route's `info.input.pathParams` hold one request's values and are not stored. A version first served without a counted payment (a self-payment, or a listing stored before scoring existed) starts at one sale at its listed price, and that floor decays like any score. A payment for another version, including the merchant's own changed price or description, is answered `rejected` (`another version of this listing has more recent payments`) and the old details stay listed until that version outscores the served one, so replacing a merchant's listing costs more than the route recently earned, paid to the merchant, and a merchant's own changed declaration takes over as its customers pay for it. Up to 2 competing versions are kept per entry, in memory only. Listings are not verified against the resource's live 402; clients pay what the live 402 asks. Only `http` resources are cataloged. The extension's `info` is checked against the Bazaar shape, but its JSON `schema` is never compiled by the facilitator, because it comes from the payer. A schema that uses `pattern` or `patternProperties` in a schema position, uses references (`$ref`, `$id`, `$anchor` or their dynamic and recursive forms; a chain of references can be exponential for a validator), or is nested more than 32 levels deep, is rejected, because the catalog serves it and the Bazaar SDK compiles it by default; consumers should still not compile a served schema with untrusted regular expressions enabled. A `description` loses line breaks and tabs, and is dropped if it holds other control characters, bidirectional overrides or zero-width characters; a `mimeType` must be a plain `type/subtype` with optional parameters. The extension is at most 4,096 characters as JSON, and a whole entry, including the listed payment requirements (only their standard fields are kept), at most 8,192. A `payTo` has at most 50 entries and the catalog at most 2,000. When a `payTo` or the catalog is full, a new entry replaces the weakest one (the least recently paid among equals) only if it is stronger, or if the weakest has not been paid for 7 days; a tie keeps the existing entry. Self-payments (payer equals `payTo`) never add strength. Within a `payTo`, strength is the USDC paid to that `payTo` for the entry, with no cap: a new route gets in once its customers have paid more for it than was paid for the weakest listing, so pushing out a merchant's routes costs more than they earn, paid to the merchant. Across the catalog, strength is the payer count, each payer adding at most 4, for up to 32 payers (128 at most), because payments between addresses one party controls cost that party nothing. A rejected entry's strength is kept in memory only, for 7 days after its last payment: at most 50 per `payTo` (the least paid forgotten first) and 2,000 in all (beyond that, the `payTo`s with the most give up their least paid entry, the least recently paid among equals). A refusal that adds no strength, such as a self-payment, is not remembered. So is the score of each version it was paid with (at most 3). A refused entry is admitted only by a payment for its strongest version, the rule a listed entry follows: a payment for a weaker version adds to the entry's strength but is answered `rejected`, and nothing is pushed out for it. The admitted version starts with what it was paid while it waited, and the other versions keep competing with what they earned. An update by another payer keeps the entry's strength and adds that payment to it. An entry not paid for 30 days is dropped, whether or not the catalog is full. Entries saved by an earlier version are checked against the same rules on load; a date in the future is set to the load time, and a catalog file that cannot be read is moved to `catalog.json.corrupt-<time>` and the catalog starts empty. A search query is at most 200 characters and 10 words. A catalog failure never changes the settle result. The `/settle` response then carries the `EXTENSION-RESPONSES` header: base64 JSON of `{ "bazaar": { "status": "success" | "rejected", "rejectedReason"? } }`, where `rejectedReason` is a short fixed string; details go to the facilitator's log.
 
 ## 6. Cancellation
 
@@ -196,15 +208,17 @@ A payer can make an unsettled payment unusable before its deadline passes:
 | `invalid_signature` | The signature does not authorize this payment |
 | `payment_expired` | `validUntil` has passed |
 | `asset_mismatch`, `payto_mismatch`, `amount_mismatch` | The payment is not the one quoted |
-| `nonce_used` | The nonce has moved on; the payment was used or cancelled |
+| `nonce_used` | The nonce has moved on; the payment was used or cancelled. `/settle` never answers it while the facilitator holds the payment's claim (2.3); `/verify` can |
 | `payer_busy` | Another payment from the same EOA is being settled |
 | `insufficient_funds` | Not enough USDC for the payment, or not enough CENT or USDC for gas |
 | `transfer_gate_pending`, `transfer_gate_blocked`, `transfer_gate_unavailable` | TransferGate would escrow or block the transfer, or could not be read |
 | `simulation_failed` | The transfer or the operation fails in simulation |
 | `already_settled`, `already_settling` | The payment was already reported to another request (2.3) |
-| `settle_timeout` | Submitted, but no receipt within 60 seconds; retry the same payload |
+| `settle_timeout` | No receipt within 60 seconds (the payment may have been submitted), or the checks did not finish in time (nothing was submitted); retry the same payload |
 | `tx_rejected`, `tx_reverted` | The RPC rejected the transaction, or it reverted |
 | `userop_rejected`, `userop_reverted` | The bundler rejected the operation, or it reverted |
+| `settle_unrecorded` | The payment executed but could not be recorded; retry the same payload (2.3) |
+| `store_unavailable` | The facilitator cannot record claims; nothing was submitted |
 | `unexpected_verify_error`, `unexpected_settle_error` | An internal error |
 
 ## 8. Security considerations

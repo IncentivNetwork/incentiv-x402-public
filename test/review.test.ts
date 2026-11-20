@@ -117,7 +117,7 @@ test("a catalog file saved before the key held network and payTo loses those ent
     "GET https://api.example.com/weather": entry,
     [`GET https://api.example.com/other eip155:24101 ${merchant.toLowerCase()}`]: { ...entry, resource: "https://api.example.com/other" },
   }));
-  const c = new Catalog(path);
+  const c = new Catalog(path, () => Date.parse("2026-11-19T01:00:00Z"));
   assert.deepEqual(c.list({}).items.map((e) => e.resource), ["https://api.example.com/other"]);
   assert.equal(Object.keys(JSON.parse(readFileSync(path, "utf8"))).length, 1, "the cleaned file is saved");
 });

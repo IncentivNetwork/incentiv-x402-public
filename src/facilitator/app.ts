@@ -1,10 +1,32 @@
-import express, { type Express, type Request, type Response } from "express";
+import express, { type Express, type NextFunction, type Request, type Response } from "express";
 import { x402Facilitator } from "@x402/core/facilitator";
-import { NETWORK } from "../constants.js";
-import { Catalog } from "./catalog.js";
+import { EOA_SCHEME, NETWORK, SCHEME } from "../constants.js";
+import { Catalog, QueryTooLongError } from "./catalog.js";
 import { IncentivEoaTxFacilitatorScheme } from "../scheme/facilitator-eoa.js";
 import { IncentivUserOpFacilitatorScheme, type FacilitatorOptions } from "../scheme/facilitator.js";
 import { makeChain } from "../userop.js";
+import { logMessage, logToStderr } from "../decode.js";
+
+/**
+ * The rate-limit key for a client address. An IPv6 client usually holds a whole /64, so it is counted per /64;
+ * an IPv4 address, including one written as IPv4-mapped IPv6, is counted on its own.
+ */
+export function rateKey(ip: string | undefined): string {
+  if (!ip) return "unknown";
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip);
+  if (mapped) return mapped[1]!;
+  const hexMapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(ip);
+  if (hexMapped) {
+    const [hi, lo] = [parseInt(hexMapped[1]!, 16), parseInt(hexMapped[2]!, 16)];
+    return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  }
+  if (!ip.includes(":")) return ip;
+  const [head = "", tail] = ip.toLowerCase().split("%")[0]!.split("::");
+  const left = head ? head.split(":") : [];
+  const right = tail ? tail.split(":") : [];
+  const groups = tail === undefined ? left : [...left, ...Array<string>(Math.max(8 - left.length - right.length, 0)).fill("0"), ...right];
+  return `${groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, "")).join(":")}::/64`;
+}
 
 /** A fixed-window counter per client address. */
 export class RateLimit {
@@ -39,13 +61,20 @@ export class RateLimit {
 export interface FacilitatorAppOptions extends FacilitatorOptions {
   verifyPerMinute?: number;
   settlePerMinute?: number;
+  /** Calls per minute per address to /discovery/*. Default 120. */
+  discoveryPerMinute?: number;
   /** Where discovered resources are kept. Defaults to an in-memory catalog. */
   catalog?: Catalog;
-  /** Express "trust proxy" setting, so rate limits see the real client address behind a load balancer. */
-  trustProxy?: boolean | number | string;
-  /** Called with one line of JSON per settle outcome. */
-  log?: (line: Record<string, unknown>) => void;
+  /**
+   * Express "trust proxy" setting, so rate limits see the real client address behind a load balancer: the number
+   * of proxies in front (1 behind an AWS ALB), or the proxies' addresses. `true` is refused, because it takes the
+   * client address from the left end of X-Forwarded-For, which the client writes itself.
+   */
+  trustProxy?: false | number | string;
 }
+
+/** How long a /health answer is reused, so the endpoint cannot be used to flood the RPC and bundler. */
+const HEALTH_CACHE_MS = 5_000;
 
 export function createFacilitatorApp(options: FacilitatorAppOptions = {}): {
   app: Express;
@@ -53,28 +82,41 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): {
   eoaScheme: IncentivEoaTxFacilitatorScheme;
   catalog: Catalog;
 } {
-  const scheme = new IncentivUserOpFacilitatorScheme(options);
-  const eoaScheme = new IncentivEoaTxFacilitatorScheme(options);
-  const catalog = options.catalog ?? new Catalog();
+  // Without a log function, lines go to stderr, so unexpected errors are never silent.
+  const log = options.log ?? logToStderr;
+  const scheme = new IncentivUserOpFacilitatorScheme({ ...options, log });
+  const eoaScheme = new IncentivEoaTxFacilitatorScheme({ ...options, log });
+  const catalog = options.catalog ?? new Catalog(undefined, undefined, log);
   const facilitator = new x402Facilitator().register(NETWORK, eoaScheme).register(NETWORK, scheme).registerExtension({ key: "bazaar" });
   const chain = makeChain(options.config);
   const verifyLimit = new RateLimit(options.verifyPerMinute ?? 120);
   const settleLimit = new RateLimit(options.settlePerMinute ?? 60);
+  const discoveryLimit = new RateLimit(options.discoveryPerMinute ?? 120);
 
   const app = express();
   app.disable("x-powered-by");
+  if ((options.trustProxy as unknown) === true || options.trustProxy === "true") {
+    throw new Error("trustProxy: true trusts a forged X-Forwarded-For; give the number of proxies in front (1 behind one load balancer)");
+  }
   if (options.trustProxy !== undefined) app.set("trust proxy", options.trustProxy);
   app.use(express.json({ limit: "64kb" }));
 
   const limited = (limit: RateLimit) => (req: Request, res: Response, next: () => void) => {
-    if (limit.allow(req.ip ?? "unknown")) return next();
+    if (limit.allow(rateKey(req.ip))) return next();
     res.status(429).json({ error: "rate_limited" });
   };
 
+  const supportedSchemes = new Set<unknown>([SCHEME, EOA_SCHEME]);
   const body = (req: Request, res: Response) => {
     const { paymentPayload, paymentRequirements } = req.body ?? {};
-    if (!paymentPayload || !paymentRequirements) {
+    if (!paymentPayload || !paymentRequirements || typeof paymentPayload !== "object" || typeof paymentRequirements !== "object") {
       res.status(400).json({ error: "invalid_request" });
+      return undefined;
+    }
+    // x402Facilitator throws for a scheme, network or version nothing is registered for: that is the client's
+    // mistake, answered here as 400 rather than as an internal error.
+    if (!supportedSchemes.has(paymentRequirements.scheme) || paymentRequirements.network !== NETWORK || paymentPayload.x402Version !== 2) {
+      res.status(400).json({ error: "unsupported_scheme" });
       return undefined;
     }
     return { paymentPayload, paymentRequirements };
@@ -84,7 +126,8 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): {
     res.set("cache-control", "public, max-age=60").json(facilitator.getSupported());
   });
 
-  app.get("/health", async (_req, res) => {
+  let health: { at: number; result: Promise<{ rpc: string; bundler: string }> } | undefined;
+  const checkHealth = async () => {
     const ok = async (f: () => Promise<unknown>) => f().then(() => "ok", () => "down");
     const [rpc, bundler] = await Promise.all([
       ok(() => chain.client.getBlockNumber()),
@@ -98,7 +141,14 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): {
         if (!r.ok) throw new Error(String(r.status));
       }),
     ]);
-    res.status(rpc === "ok" && bundler === "ok" ? 200 : 503).json({ status: rpc === "ok" && bundler === "ok" ? "ok" : "degraded", rpc, bundler });
+    return { rpc, bundler };
+  };
+  app.get("/health", async (_req, res) => {
+    const now = Date.now();
+    if (!health || now - health.at >= HEALTH_CACHE_MS) health = { at: now, result: checkHealth() };
+    const { rpc, bundler } = await health.result;
+    const up = rpc === "ok" && bundler === "ok";
+    res.status(up ? 200 : 503).json({ status: up ? "ok" : "degraded", rpc, bundler });
   });
 
   app.post("/verify", limited(verifyLimit), async (req, res) => {
@@ -111,7 +161,7 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): {
     const b = body(req, res);
     if (!b) return;
     const result = await facilitator.settle(b.paymentPayload, b.paymentRequirements);
-    options.log?.({
+    log({
       event: "settle",
       scheme: b.paymentRequirements.scheme,
       success: result.success,
@@ -121,15 +171,27 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): {
       amount: result.amount,
     });
     // A paid resource that declared Bazaar discovery info is cataloged, and the merchant is told the outcome.
+    // The payment is final by now: a catalog failure must never turn it into an error for the merchant.
     if (result.success && b.paymentPayload.extensions?.bazaar) {
-      const status = catalog.record(b.paymentPayload, b.paymentRequirements);
-      res.set("EXTENSION-RESPONSES", Buffer.from(JSON.stringify({ bazaar: status })).toString("base64"));
+      let status: ReturnType<Catalog["record"]>;
+      try {
+        status = catalog.record(b.paymentPayload, b.paymentRequirements, undefined, result.payer);
+      } catch (e) {
+        log({ event: "catalog_error", error: logMessage(e) });
+        status = { status: "rejected", rejectedReason: "the catalog is unavailable" };
+      }
+      if (status.status === "rejected") log({ event: "catalog_rejected", reason: status.rejectedReason, ...(status.detail ? { detail: status.detail } : {}) });
+      // Only the status and the fixed, short reason go in the header, so it stays small for any proxy or client.
+      const header = { status: status.status, ...(status.rejectedReason ? { rejectedReason: status.rejectedReason.slice(0, 100) } : {}) };
+      res.set("EXTENSION-RESPONSES", Buffer.from(JSON.stringify({ bazaar: header })).toString("base64"));
     }
     res.json(result);
   });
 
   const num = (v: unknown) => (typeof v === "string" && /^\d+$/.test(v) ? Number(v) : undefined);
   const str = (v: unknown) => (typeof v === "string" && v !== "" ? v : undefined);
+
+  app.use("/discovery", limited(discoveryLimit));
 
   app.get("/discovery/resources", (req, res) => {
     const q = req.query;
@@ -138,7 +200,25 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): {
 
   app.get("/discovery/search", (req, res) => {
     const q = req.query;
-    res.json(catalog.search({ query: str(q.query) ?? "", type: str(q.type), payTo: str(q.payTo), scheme: str(q.scheme), network: str(q.network), limit: num(q.limit) }));
+    try {
+      res.json(catalog.search({ query: str(q.query) ?? "", type: str(q.type), payTo: str(q.payTo), scheme: str(q.scheme), network: str(q.network), limit: num(q.limit) }));
+    } catch (e) {
+      if (!(e instanceof QueryTooLongError)) throw e;
+      res.status(400).json({ error: "query_too_long", message: e.message });
+    }
+  });
+
+  // Errors never reach the client as stack traces or library messages, whatever NODE_ENV is.
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    // Only errors marked for the client (body-parser's: bad JSON, too large) are the client's fault. Others with
+    // a 4xx status, such as viem's HttpRequestError for an RPC answering 401 or 429, are the server's problem.
+    const { status, expose } = (err ?? {}) as { status?: unknown; expose?: unknown };
+    if (expose === true && typeof status === "number" && status >= 400 && status < 500) {
+      res.status(status).json({ error: "invalid_request" });
+      return;
+    }
+    log({ event: "error", error: logMessage(err) });
+    res.status(500).json({ error: "internal_error" });
   });
 
   return { app, scheme, eoaScheme, catalog };
