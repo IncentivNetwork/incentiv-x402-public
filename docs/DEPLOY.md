@@ -20,19 +20,20 @@ All settings are environment variables. Defaults are Incentiv mainnet.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PORT` | `4020` | Listening port |
-| `FACILITATOR_DATA_DIR` | `/data` in the Docker image, `./data` otherwise | Holds `settled.json` and `catalog.json`; mount a persistent volume here |
+| `FACILITATOR_DATA_DIR` | `/data` in the Docker image, `./data` otherwise | Holds `settled.json` and, with discovery on, `catalog.json`; mount a persistent volume here |
 | `INCENTIV_RPC_URL` | `https://rpc.incentiv.io` | Chain RPC; use a dedicated endpoint in production |
 | `INCENTIV_BUNDLER_URL` | `https://bundler.incentiv.io` | ERC-4337 bundler, used by `incentiv-userop` |
 | `TRUST_PROXY` | unset | Set to `1` behind one load balancer (an AWS ALB), so rate limits count real client addresses. The number of proxies, or their addresses (Express syntax); `true` is refused, because it would trust a forged `X-Forwarded-For`. IPv6 clients are counted per /64. |
 | `VERIFY_PER_MINUTE` | `120` | Per-address limit on `/verify` |
 | `SETTLE_PER_MINUTE` | `60` | Per-address limit on `/settle` |
-| `DISCOVERY_PER_MINUTE` | `120` | Per-address limit on `/discovery/resources` and `/discovery/search` |
+| `DISCOVERY` | `off` | `on` enables Bazaar discovery: the catalog of paid resources, `/discovery/resources`, `/discovery/search` and the `bazaar` extension in `/supported`. Unset or empty means `off`, as for every setting here; any other value stops startup. |
+| `DISCOVERY_PER_MINUTE` | `120` | Per-address limit on `/discovery/resources` and `/discovery/search`, with discovery on |
 
 ## AWS notes
 
 - **One task.** Use an ECS service with desired count 1, or a single EC2 instance. Do not autoscale it.
-- **Persistent data (required).** Mount EFS (or an EBS volume) at `/data`. It holds the settled payments (kept for 7 days, then forgotten; a forgotten payment is still refused on retry), the claims the facilitator records before submitting each payment, and the discovery catalog. Each write is synced to disk before it replaces the file. Without it, a payment whose settle timed out just before a restart is refused on retry (`already_settled`), so its payer is charged but not served, and the catalog starts empty.
-- **Damaged data files.** A `catalog.json` that cannot be read is moved aside and the catalog starts empty; paid requests rebuild it. A `settled.json` that cannot be read stops startup on purpose: starting without it would forget which payments were already reported, and one payment could then serve two requests. Keep the damaged file, restore the latest backup of `/data` if there is one, and start again. Empty the `claims` object in a restored `settled.json` first: a backup taken while a payment was being settled holds its claim without its result, and the payment could then be reported as a success a second time. If there is none, move the file aside and start: a payment settled before is then refused on retry (`already_settled`) rather than reported twice, so the payers of settles that were in flight are charged but not served.
+- **Persistent data (required).** Mount EFS (or an EBS volume) at `/data`. It holds the settled payments (kept for 7 days, then forgotten; a forgotten payment is still refused on retry), the claims the facilitator records before submitting each payment, and, with discovery on, the discovery catalog. Each write is synced to disk before it replaces the file. Without it, a payment whose settle timed out just before a restart is refused on retry (`already_settled`), so its payer is charged but not served, and, with discovery on, the catalog starts empty.
+- **Damaged data files.** With discovery on, a `catalog.json` that cannot be read is moved aside and the catalog starts empty; paid requests rebuild it. A `settled.json` that cannot be read stops startup on purpose: starting without it would forget which payments were already reported, and one payment could then serve two requests. Keep the damaged file, restore the latest backup of `/data` if there is one, and start again. Empty the `claims` object in a restored `settled.json` first: a backup taken while a payment was being settled holds its claim without its result, and the payment could then be reported as a success a second time. If there is none, move the file aside and start: a payment settled before is then refused on retry (`already_settled`) rather than reported twice, so the payers of settles that were in flight are charged but not served.
 - **Health check.** `GET /health` returns 200 when the RPC and the bundler both answer, and 503 otherwise. The image has a built-in container health check.
 - **TLS and domain.** Terminate TLS at the load balancer and point `x402.incentiv.io` (or your chosen name) at it. Merchants set this URL as their facilitator.
 - **Shutdown.** On SIGTERM it stops accepting requests and waits up to 70 seconds, because a settle can take up to 60 seconds from its chain checks to its answer, submission included. Set the ECS stop timeout to at least 75 seconds.
@@ -40,7 +41,7 @@ All settings are environment variables. Defaults are Incentiv mainnet.
 
   | Event | When |
   | --- | --- |
-  | `listening`, `shutdown`, `shutdown_in_progress`, `shutdown_forced` | Start, stop, a repeated SIGTERM (ignored), a SIGINT after the first signal of either kind (forced stop) |
+  | `listening`, `shutdown`, `shutdown_in_progress`, `shutdown_forced` | Start (with `discovery`: `on` or `off`), stop, a repeated SIGTERM (ignored), a SIGINT after the first signal of either kind (forced stop) |
   | `settle` | Every settle: scheme, success, reason, transaction, payer, amount |
   | `payment_error` | The original error behind a refused payment (for example a provider error) |
   | `submit_unknown` | Submitting a payment got no answer (a lost connection, a timeout, a 5xx status, an internal error, a transient RPC answer such as a rate limit, or no answer within the settle window), or was refused while the payment may still land (a nonce refusal, a refused resend, its nonce is used or pending, the bundler still holds the operation, or the RPC or bundler cannot say). The claim is kept and the receipt decides; the merchant retries a `settle_timeout` with the same payload |
@@ -55,15 +56,19 @@ All settings are environment variables. Defaults are Incentiv mainnet.
 
 | Method and path | Purpose |
 | --- | --- |
-| `GET /supported` | Schemes and extensions on offer (`bazaar` among them) |
+| `GET /supported` | Schemes and extensions on offer (`bazaar` among them, with discovery on) |
 | `POST /verify`, `POST /settle` | The x402 facilitator API |
 | `GET /health` | RPC and bundler status |
-| `GET /discovery/resources` | List cataloged paid resources; filters `type`, `payTo`, `scheme`, `network`, `limit`, `offset` |
-| `GET /discovery/search?query=` | Search cataloged resources |
+| `GET /discovery/resources` | With discovery on: list cataloged paid resources; filters `type`, `payTo`, `scheme`, `network`, `limit`, `offset` |
+| `GET /discovery/search?query=` | With discovery on: search cataloged resources |
 
 ## Discovery
 
-A resource is cataloged when a payment for it settles successfully and its route declared Bazaar discovery info (`declareDiscoveryExtension`). There is no manual registration. The merchant sees the outcome in the facilitator's `EXTENSION-RESPONSES` header: `bazaar.status` is `success` or `rejected`.
+Discovery is optional and off by default; set `DISCOVERY=on` to enable it. With it off, the facilitator keeps no catalog and does not read or write `catalog.json`, `/discovery/*` answers 404, `/supported` does not list `bazaar`, and `/settle` sends no `EXTENSION-RESPONSES` header.
+
+Upgrading a deployment that served discovery before it became optional: set `DISCOVERY=on` to keep it. With it off, an existing `catalog.json` stays in the data directory unused and can be deleted; if discovery is switched on later, the file is loaded again and its entries go through the current rules.
+
+With discovery on, a resource is cataloged when a payment for it settles successfully and its route declared Bazaar discovery info (`declareDiscoveryExtension`). There is no manual registration. The merchant sees the outcome in the facilitator's `EXTENSION-RESPONSES` header: `bazaar.status` is `success` or `rejected`.
 
 ## After deploying
 

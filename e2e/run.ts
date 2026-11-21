@@ -65,7 +65,7 @@ if (payerStart < MIN_PAYER_BALANCE) {
 
 // Facilitator and merchant, both in this process.
 const store = new MemoryStore();
-const { app: facilitatorApp } = createFacilitatorApp({ store });
+const { app: facilitatorApp } = createFacilitatorApp({ store, discovery: true });
 const servers: Server[] = [];
 await new Promise<void>((ok) => servers.push(facilitatorApp.listen(FACILITATOR_PORT, () => ok())));
 const facilitatorUrl = `http://localhost:${FACILITATOR_PORT}`;

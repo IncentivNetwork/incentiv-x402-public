@@ -64,7 +64,7 @@ if (usdcStart < MIN_USDC || centStart < MIN_CENT) {
 }
 
 const store = new MemoryStore();
-const { app: facilitatorApp } = createFacilitatorApp({ store });
+const { app: facilitatorApp } = createFacilitatorApp({ store, discovery: true });
 const servers: Server[] = [];
 await new Promise<void>((ok) => servers.push(facilitatorApp.listen(FACILITATOR_PORT, () => ok())));
 const facilitatorUrl = `http://localhost:${FACILITATOR_PORT}`;

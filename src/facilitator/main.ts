@@ -17,6 +17,16 @@ const intEnv = (name: string, fallback?: number): number | undefined => {
   }
   return Number(raw);
 };
+/** An on/off setting, or the default when it is unset or empty; anything else stops the process at startup. */
+const flagEnv = (name: string, fallback: boolean): boolean => {
+  const raw = env(name);
+  if (raw === undefined) return fallback;
+  if (raw !== "on" && raw !== "off") {
+    console.error(`${name} must be "on" or "off", got "${raw}"`);
+    process.exit(1);
+  }
+  return raw === "on";
+};
 const port = intEnv("PORT", 4020)!;
 const dataDir = env("FACILITATOR_DATA_DIR") ?? join(process.cwd(), "data");
 const config: IncentivConfig = {
@@ -31,16 +41,26 @@ if (trust === "true") {
 }
 const log = (line: Record<string, unknown>) => console.log(JSON.stringify({ time: new Date().toISOString(), ...line }));
 
-const catalog = new Catalog(join(dataDir, "catalog.json"), Date.now, log);
+// Discovery is optional and off by default. With it off there is no catalog: catalog.json is neither read nor
+// written.
+const discovery = flagEnv("DISCOVERY", false);
+const catalog = discovery ? new Catalog(join(dataDir, "catalog.json"), Date.now, log) : undefined;
 const { app } = createFacilitatorApp({
   config,
   store: new FileStore(join(dataDir, "settled.json")),
+  discovery,
   catalog,
   trustProxy: trust === undefined ? undefined : /^\d+$/.test(trust) ? Number(trust) : trust,
   verifyPerMinute: intEnv("VERIFY_PER_MINUTE"),
   settlePerMinute: intEnv("SETTLE_PER_MINUTE"),
   discoveryPerMinute: intEnv("DISCOVERY_PER_MINUTE"),
   log,
+});
+// A path the service does not serve answers JSON like every other answer, not Express's HTML page; with discovery
+// off, that includes /discovery/*. It is added here rather than in createFacilitatorApp, so an app that adds routes
+// to the facilitator app, or mounts it, still reaches its own routes.
+app.use((_req, res) => {
+  res.status(404).json({ error: "not_found" });
 });
 
 // Only hosts are logged: dedicated RPC URLs often carry an API key in the path or query.
@@ -51,11 +71,14 @@ const host = (url: string) => {
     return "invalid url";
   }
 };
-const server = app.listen(port, () => log({ event: "listening", port, dataDir, rpc: host(config.rpcUrl), bundler: host(config.bundlerUrl) }));
-// Settles still in flight can add catalog entries, so the catalog is written last, right before exiting.
+const server = app.listen(port, () =>
+  log({ event: "listening", port, dataDir, discovery: discovery ? "on" : "off", rpc: host(config.rpcUrl), bundler: host(config.bundlerUrl) }),
+);
+// Settles still in flight can add catalog entries, so the catalog (with discovery on) is written last, right
+// before exiting.
 const exit = (code: number) => {
   try {
-    catalog.flush();
+    catalog?.flush();
   } catch (e) {
     log({ event: "catalog_save_failed", error: logMessage(e) });
   }

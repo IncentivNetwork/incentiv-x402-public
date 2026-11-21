@@ -61,9 +61,18 @@ export class RateLimit {
 export interface FacilitatorAppOptions extends FacilitatorOptions {
   verifyPerMinute?: number;
   settlePerMinute?: number;
+  /**
+   * Bazaar discovery: the catalog of paid resources, `/discovery/*` and the `bazaar` extension in `/supported`.
+   * Off by default; when off, no catalog is kept and a settle records nothing. Only `true` turns it on: any
+   * value that is not a boolean (a string such as "off", say) is refused.
+   */
+  discovery?: boolean;
   /** Calls per minute per address to /discovery/*. Default 120. */
   discoveryPerMinute?: number;
-  /** Where discovered resources are kept. Defaults to an in-memory catalog. */
+  /**
+   * Where discovered resources are kept. Defaults to an in-memory catalog. It needs `discovery: true`: a catalog
+   * given with discovery off is refused, so discovery is never left off by mistake.
+   */
   catalog?: Catalog;
   /**
    * Express "trust proxy" setting, so rate limits see the real client address behind a load balancer: the number
@@ -80,17 +89,28 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): {
   app: Express;
   scheme: IncentivUserOpFacilitatorScheme;
   eoaScheme: IncentivEoaTxFacilitatorScheme;
-  catalog: Catalog;
+  /** The catalog in use; undefined with discovery off. */
+  catalog: Catalog | undefined;
 } {
+  // Discovery is on only for `discovery: true`. A truthy string from a setting ("off") must not turn it on, and
+  // a catalog that would be ignored is a mistake worth stopping for.
+  if (options.discovery !== undefined && typeof options.discovery !== "boolean") {
+    throw new Error(`discovery must be true or false, got ${JSON.stringify(options.discovery)}`);
+  }
+  if (options.catalog !== undefined && options.discovery !== true) {
+    throw new Error("a catalog needs discovery: true; with discovery off no catalog is kept");
+  }
   // Without a log function, lines go to stderr, so unexpected errors are never silent.
   const log = options.log ?? logToStderr;
   const scheme = new IncentivUserOpFacilitatorScheme({ ...options, log });
   const eoaScheme = new IncentivEoaTxFacilitatorScheme({ ...options, log });
-  const catalog = options.catalog ?? new Catalog(undefined, undefined, log);
-  const facilitator = new x402Facilitator().register(NETWORK, eoaScheme).register(NETWORK, scheme).registerExtension({ key: "bazaar" });
+  const catalog = options.discovery === true ? (options.catalog ?? new Catalog(undefined, undefined, log)) : undefined;
+  const facilitator = new x402Facilitator().register(NETWORK, eoaScheme).register(NETWORK, scheme);
+  if (catalog) facilitator.registerExtension({ key: "bazaar" });
   const chain = makeChain(options.config);
   const verifyLimit = new RateLimit(options.verifyPerMinute ?? 120);
   const settleLimit = new RateLimit(options.settlePerMinute ?? 60);
+  // Built, and so validated, in both modes; used only with discovery on.
   const discoveryLimit = new RateLimit(options.discoveryPerMinute ?? 120);
 
   const app = express();
@@ -170,9 +190,10 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): {
       payer: result.payer,
       amount: result.amount,
     });
-    // A paid resource that declared Bazaar discovery info is cataloged, and the merchant is told the outcome.
-    // The payment is final by now: a catalog failure must never turn it into an error for the merchant.
-    if (result.success && b.paymentPayload.extensions?.bazaar) {
+    // With discovery on, a paid resource that declared Bazaar discovery info is cataloged, and the merchant is
+    // told the outcome. The payment is final by now: a catalog failure must never turn it into an error for the
+    // merchant.
+    if (catalog && result.success && b.paymentPayload.extensions?.bazaar) {
       let status: ReturnType<Catalog["record"]>;
       try {
         status = catalog.record(b.paymentPayload, b.paymentRequirements, undefined, result.payer);
@@ -191,22 +212,25 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): {
   const num = (v: unknown) => (typeof v === "string" && /^\d+$/.test(v) ? Number(v) : undefined);
   const str = (v: unknown) => (typeof v === "string" && v !== "" ? v : undefined);
 
-  app.use("/discovery", limited(discoveryLimit));
+  // The discovery routes exist only with discovery on.
+  if (catalog) {
+    app.use("/discovery", limited(discoveryLimit));
 
-  app.get("/discovery/resources", (req, res) => {
-    const q = req.query;
-    res.json(catalog.list({ type: str(q.type), payTo: str(q.payTo), scheme: str(q.scheme), network: str(q.network), limit: num(q.limit), offset: num(q.offset) }));
-  });
+    app.get("/discovery/resources", (req, res) => {
+      const q = req.query;
+      res.json(catalog.list({ type: str(q.type), payTo: str(q.payTo), scheme: str(q.scheme), network: str(q.network), limit: num(q.limit), offset: num(q.offset) }));
+    });
 
-  app.get("/discovery/search", (req, res) => {
-    const q = req.query;
-    try {
-      res.json(catalog.search({ query: str(q.query) ?? "", type: str(q.type), payTo: str(q.payTo), scheme: str(q.scheme), network: str(q.network), limit: num(q.limit) }));
-    } catch (e) {
-      if (!(e instanceof QueryTooLongError)) throw e;
-      res.status(400).json({ error: "query_too_long", message: e.message });
-    }
-  });
+    app.get("/discovery/search", (req, res) => {
+      const q = req.query;
+      try {
+        res.json(catalog.search({ query: str(q.query) ?? "", type: str(q.type), payTo: str(q.payTo), scheme: str(q.scheme), network: str(q.network), limit: num(q.limit) }));
+      } catch (e) {
+        if (!(e instanceof QueryTooLongError)) throw e;
+        res.status(400).json({ error: "query_too_long", message: e.message });
+      }
+    });
+  }
 
   // Errors never reach the client as stack traces or library messages, whatever NODE_ENV is.
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {

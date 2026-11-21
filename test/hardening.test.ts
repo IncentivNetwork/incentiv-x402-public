@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { declareDiscoveryExtension } from "@x402/extensions/bazaar";
 import { spawn } from "node:child_process";
+import express from "express";
 import { createFacilitatorApp, rateKey } from "../src/facilitator/app.js";
 import { Catalog, CATALOG_LIMITS, QueryTooLongError } from "../src/facilitator/catalog.js";
 import { CLAIM_TTL_MS, FileStore, MemoryStore, RESULT_TTL_MS } from "../src/facilitator/store.js";
@@ -554,7 +555,7 @@ test("a catalog failure never turns a successful settle into an error, and error
     throw new Error("disk full at /data/catalog.json");
   };
   const logged: Record<string, unknown>[] = [];
-  const { app, eoaScheme } = createFacilitatorApp({ catalog, discoveryPerMinute: 2, log: (l) => logged.push(l) });
+  const { app, eoaScheme } = createFacilitatorApp({ discovery: true, catalog, discoveryPerMinute: 2, log: (l) => logged.push(l) });
   const settled = { success: true, payer: merchant, transaction: "0x01", network: "eip155:24101", amount: "1" };
   eoaScheme.settle = async () => settled as never;
   const { base, close } = await serve(app);
@@ -891,7 +892,7 @@ test("an error with a 4xx status from a dependency is a 500 and is logged, not t
     throw Object.assign(new Error("HTTP request failed. Status: 429 URL: https://rpc.example/KEY"), { status: 429 });
   };
   const logged: Record<string, unknown>[] = [];
-  const { app } = createFacilitatorApp({ catalog, log: (l) => logged.push(l) });
+  const { app } = createFacilitatorApp({ discovery: true, catalog, log: (l) => logged.push(l) });
   const { base, close } = await serve(app);
   try {
     const r = await fetch(`${base}/discovery/resources`);
@@ -1826,7 +1827,7 @@ test("the app passes the settled payer to the catalog, so its payments count", a
     payers.push(payer);
     return { status: "success" };
   };
-  const { app, eoaScheme } = createFacilitatorApp({ catalog, log: () => {} });
+  const { app, eoaScheme } = createFacilitatorApp({ discovery: true, catalog, log: () => {} });
   const customer = addr(4242);
   eoaScheme.settle = async () => ({ success: true, payer: customer, transaction: "0x01", network: "eip155:24101", amount: "1" }) as never;
   const { base, close } = await serve(app);
@@ -1836,6 +1837,182 @@ test("the app passes the settled payer to the catalog, so its payments count", a
   } finally {
     await close();
   }
+});
+
+test("discovery is off by default: no discovery routes, no bazaar extension, and a settle records nothing", async () => {
+  // Any catalog the app might still create would record through the prototype.
+  let recorded = 0;
+  const record = Catalog.prototype.record;
+  Catalog.prototype.record = () => {
+    recorded++;
+    return { status: "success" };
+  };
+  let close = async () => {};
+  try {
+    const made = createFacilitatorApp({ log: () => {} });
+    assert.equal(made.catalog, undefined, "no catalog is kept");
+    made.eoaScheme.settle = async () => ({ success: true, payer: addr(7), transaction: "0x01", network: "eip155:24101", amount: "1" }) as never;
+    const served = await serve(made.app);
+    close = served.close;
+    const base = served.base;
+    // Not served. The answer's body is left to the caller; the service answers JSON (see the service start test).
+    assert.equal((await fetch(`${base}/discovery/resources`)).status, 404);
+    assert.equal((await fetch(`${base}/discovery/search?query=weather`)).status, 404);
+    const supported = (await (await fetch(`${base}/supported`)).json()) as { extensions: string[] };
+    assert.deepEqual(supported.extensions, [], "bazaar is not on offer");
+    const r = await fetch(`${base}/settle`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ paymentPayload: payload("https://api.example.com/weather"), paymentRequirements: req() }) });
+    assert.equal(r.status, 200);
+    assert.equal(((await r.json()) as { success: boolean }).success, true, "the settle itself is unchanged");
+    assert.equal(r.headers.get("extension-responses"), null, "no Bazaar status is sent");
+    assert.equal(recorded, 0, "nothing is cataloged");
+  } finally {
+    Catalog.prototype.record = record;
+    await close();
+  }
+});
+
+test("discovery is on only for discovery: true, and options that contradict each other are refused", () => {
+  const log = () => {};
+  // A string from a setting is truthy; it must never switch discovery on.
+  for (const value of ["off", "on", "true", 1, null]) {
+    assert.throws(() => createFacilitatorApp({ discovery: value as never, log }), /discovery must be true or false/, String(value));
+  }
+  // A catalog with discovery off would be ignored without a word.
+  assert.throws(() => createFacilitatorApp({ catalog: new Catalog(), log }), /a catalog needs discovery: true/);
+  assert.throws(() => createFacilitatorApp({ discovery: false, catalog: new Catalog(), log }), /a catalog needs discovery: true/);
+  assert.equal(createFacilitatorApp({ discovery: false, log }).catalog, undefined);
+  const catalog = new Catalog();
+  assert.equal(createFacilitatorApp({ discovery: true, catalog, log }).catalog, catalog);
+  // The discovery rate limit is checked whether or not discovery is on.
+  for (const discovery of [undefined, false, true]) {
+    assert.throws(() => createFacilitatorApp({ discovery, discoveryPerMinute: 0, log }), /rate limit must be a positive integer/, String(discovery));
+  }
+});
+
+test("createFacilitatorApp leaves unknown paths to the caller: a route added after it, or an outer app it is mounted in, is reached", async () => {
+  const { app } = createFacilitatorApp({ log: () => {} });
+  app.get("/metrics", (_req, res) => {
+    res.json({ ok: true });
+  });
+  const outer = express();
+  outer.use(createFacilitatorApp({ log: () => {} }).app);
+  outer.get("/merchant", (_req, res) => {
+    res.json({ ok: true });
+  });
+  for (const [served, path] of [[app, "/metrics"], [outer, "/merchant"], [outer, "/supported"]] as const) {
+    const { base, close } = await serve(served);
+    try {
+      assert.equal((await fetch(base + path)).status, 200, path);
+    } finally {
+      await close();
+    }
+  }
+});
+
+test("with discovery on, the discovery routes and the bazaar extension are on offer", async () => {
+  const made = createFacilitatorApp({ discovery: true, log: () => {} });
+  assert.ok(made.catalog, "an in-memory catalog is the default");
+  made.eoaScheme.settle = async () => ({ success: true, payer: addr(7), transaction: "0x01", network: "eip155:24101", amount: "1" }) as never;
+  const { base, close } = await serve(made.app);
+  try {
+    const supported = (await (await fetch(`${base}/supported`)).json()) as { extensions: string[] };
+    assert.deepEqual(supported.extensions, ["bazaar"]);
+    const r = await fetch(`${base}/settle`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ paymentPayload: payload("https://api.example.com/weather"), paymentRequirements: req() }) });
+    const status = JSON.parse(Buffer.from(r.headers.get("extension-responses") ?? "", "base64").toString()) as { bazaar: { status: string } };
+    assert.equal(status.bazaar.status, "success");
+    const listed = (await (await fetch(`${base}/discovery/resources`)).json()) as { items: { resource: string }[] };
+    assert.deepEqual(listed.items.map((e) => e.resource), ["https://api.example.com/weather"]);
+    assert.equal((await fetch(`${base}/discovery/search?query=weather`)).status, 200);
+  } finally {
+    await close();
+  }
+});
+
+test("the service reads and writes catalog.json only with DISCOVERY=on, refuses any other value, and answers JSON for paths it does not serve", { timeout: 60_000 }, async (t) => {
+  // The data directories this test creates are removed when it ends, whatever the outcome.
+  const dirs: string[] = [];
+  t.after(() => {
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+  });
+  // Starts the real entry point, waits for its "listening" line (or its exit), and stops it.
+  // `whileRunning` gets the service's base URL once it listens, before it is stopped.
+  const start = async (dir: string, discovery?: string, whileRunning?: (base: string) => Promise<void>) => {
+    const port = await freePort();
+    const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(port), FACILITATOR_DATA_DIR: dir };
+    delete env.DISCOVERY;
+    if (discovery !== undefined) env.DISCOVERY = discovery;
+    const child = spawn(process.execPath, ["--import", "tsx", "src/facilitator/main.ts"], { env, stdio: ["ignore", "pipe", "pipe"] });
+    const lines: Record<string, unknown>[] = [];
+    let buffer = "";
+    let err = "";
+    child.stdout.on("data", (d: Buffer) => {
+      // Only finished lines are parsed: a chunk can end in the middle of one, and that part waits for the rest.
+      buffer += d.toString();
+      const parts = buffer.split("\n");
+      buffer = parts.pop()!;
+      for (const l of parts) {
+        if (!l.trim()) continue;
+        try {
+          lines.push(JSON.parse(l) as Record<string, unknown>);
+        } catch {
+          /* not a log line */
+        }
+      }
+    });
+    child.stderr.on("data", (d: Buffer) => (err += d.toString()));
+    const exited = new Promise<number | null>((ok) => child.on("exit", (code) => ok(code)));
+    const listening = () => lines.find((l) => l.event === "listening");
+    try {
+      for (let i = 0; i < 400 && !listening() && child.exitCode === null; i++) await new Promise((r) => setTimeout(r, 50));
+      if (whileRunning && listening()) await whileRunning(`http://127.0.0.1:${port}`);
+    } finally {
+      // Whatever happened above, the child is stopped, so a failure cannot leave it running.
+      if (child.exitCode === null) child.kill();
+    }
+    return { line: listening(), code: await exited, err };
+  };
+  const broken = "{not a catalog";
+  const dirWith = () => {
+    const dir = mkdtempSync(join(tmpdir(), "x402-discovery-"));
+    dirs.push(dir);
+    writeFileSync(join(dir, "catalog.json"), broken);
+    return dir;
+  };
+
+  // Off by default: the file is not touched, although it cannot be read.
+  const off = dirWith();
+  const stoppedOff = await start(off, undefined, async (base) => {
+    // Every path the service does not serve, /discovery/* included with discovery off, answers JSON.
+    for (const path of ["/discovery/resources", "/discovery/search?query=weather", "/no-such-path"]) {
+      const notServed = await fetch(base + path);
+      assert.equal(notServed.status, 404, path);
+      assert.match(notServed.headers.get("content-type") ?? "", /^application\/json/, path);
+      assert.deepEqual(await notServed.json(), { error: "not_found" }, path);
+    }
+    const posted = await fetch(`${base}/no-such-path`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    assert.equal(posted.status, 404);
+    assert.deepEqual(await posted.json(), { error: "not_found" });
+  });
+  assert.equal(stoppedOff.line?.discovery, "off", stoppedOff.err);
+  assert.deepEqual(readdirSync(off), ["catalog.json"]);
+  assert.equal(readFileSync(join(off, "catalog.json"), "utf8"), broken);
+
+  // On: the catalog is loaded, so the unreadable file is moved aside.
+  const on = dirWith();
+  const stoppedOn = await start(on, "on");
+  assert.equal(stoppedOn.line?.discovery, "on", stoppedOn.err);
+  assert.ok(readdirSync(on).some((f) => f.startsWith("catalog.json.corrupt-")), readdirSync(on).join(", "));
+
+  // An empty value is an unset one, as for every setting: off.
+  const empty = dirWith();
+  assert.equal((await start(empty, "")).line?.discovery, "off");
+  assert.deepEqual(readdirSync(empty), ["catalog.json"]);
+
+  // Anything else stops startup with a message.
+  const refused = await start(dirWith(), "yes");
+  assert.equal(refused.line, undefined);
+  assert.equal(refused.code, 1);
+  assert.match(refused.err, /DISCOVERY must be "on" or "off"/);
 });
 
 test("user operations: verify recovers a claimed, successful operation after its deadline too", async () => {

@@ -58,7 +58,7 @@ app.listen(4021);
 
 ### Be discoverable
 
-Declare discovery info, and the facilitator catalogs the route after its first paid request. Agents then find it through `/discovery/resources` and `/discovery/search`. No registration is needed.
+Declare discovery info, and a facilitator that runs with discovery on catalogs the route after its first paid request. Agents then find it through `/discovery/resources` and `/discovery/search`. No registration is needed. Discovery is optional and off by default (`DISCOVERY=on` enables it). A facilitator that offers it lists `bazaar` under `extensions` in its `/supported` answer.
 
 ```ts
 import { bazaarResourceServerExtension, declareDiscoveryExtension } from "@x402/extensions/bazaar";
@@ -115,7 +115,7 @@ docker build -t incentiv-x402-facilitator .
 docker run -p 4020:4020 -v x402-data:/data incentiv-x402-facilitator
 ```
 
-It serves `/supported`, `/verify`, `/settle`, `/health`, `/discovery/resources` and `/discovery/search`. It holds no private key. **Run exactly one instance, with persistent storage at `/data`.** Configuration, AWS notes and operations are in [docs/DEPLOY.md](docs/DEPLOY.md).
+It serves `/supported`, `/verify`, `/settle` and `/health`, and with `DISCOVERY=on` also `/discovery/resources` and `/discovery/search`. It holds no private key. **Run exactly one instance, with persistent storage at `/data`.** Configuration, AWS notes and operations are in [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## Costs
 
