@@ -20,10 +20,13 @@ import {
   SettleDeadlineError,
   withDeadline,
   type Chain,
+  type OpReceipt,
   type UserOp,
 } from "../userop.js";
 import type { UserOpPaymentPayload } from "./client.js";
+import { TRANSFER_MISSING, userOperationOutcome } from "../facilitator/settlement.js";
 
+const MAX_BUNDLE_CANDIDATES = 4;
 const MAGIC_VALUE = "0x1626ba7e";
 const CLOCK_SKEW_SECONDS = 5;
 
@@ -88,8 +91,17 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
       // recorded: the chain no longer matches the payload (its nonce is used), so it is valid as is, and the
       // settle that follows records it and reports it once. That is how a verify-first merchant recovers it.
       const claimed = this.store.isClaimed(parsed.userOpHash);
-      const receipt = claimed ? await getOpReceipt(this.chain, parsed.userOpHash).catch(() => undefined) : undefined;
-      if (receipt?.success) return { isValid: true, payer: parsed.payer };
+      const deadline = this.now() + this.settleTimeoutMs;
+      const bundled = claimed ? await this.within(deadline, () => getOpReceipt(this.chain, parsed.userOpHash)) : undefined;
+      const chainReceipt = bundled?.transactionHash
+        ? await this.within(deadline, () => this.chain.client.getTransactionReceipt({ hash: bundled.transactionHash! })) : undefined;
+      const outcome = chainReceipt?.status === "success" && Array.isArray(chainReceipt.logs)
+        ? userOperationOutcome(chainReceipt.logs, this.cfg.entryPoint, parsed.userOpHash, parsed.payer, parsed.op.nonce, parsed.decoded)
+        : undefined;
+      if (outcome === "missing") throw new PaymentError("payment_transfer_missing", TRANSFER_MISSING);
+      if (outcome === "success" || (!chainReceipt && bundled?.transactionHash)) {
+        return { isValid: true, payer: parsed.payer };
+      }
       try {
         this.checkDeadline(parsed);
         const c = await this.checkChain(parsed, { rejectSettled: false });
@@ -98,7 +110,8 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
         // Submitted here before and it may still land (queued past its deadline, or bundled but not yet visible):
         // valid, so a verify-first merchant settles again, and that settle waits for the receipt without
         // submitting it again.
-        if (claimed && !receipt && e instanceof PaymentError && (await this.mayStillLand(parsed, e.reason, this.now() + this.settleTimeoutMs))) {
+        const inconclusive = outcome === undefined;
+        if (claimed && inconclusive && e instanceof PaymentError && (await this.mayStillLand(parsed, e.reason, this.now() + this.settleTimeoutMs))) {
           return { isValid: true, payer: parsed.payer };
         }
         throw e;
@@ -304,6 +317,16 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
     return { success: false, errorReason: reason, errorMessage: message, payer, transaction, network: NETWORK };
   }
 
+  private async confirmReceipt(c: Checked, located: OpReceipt) {
+    if (!located.transactionHash) return undefined;
+    // A locator provides the transaction hash. Only the chain receipt establishes execution.
+    const receipt = await this.chain.client.getTransactionReceipt({ hash: located.transactionHash });
+    if (receipt.status !== "success") return undefined;
+    const outcome = userOperationOutcome(receipt.logs, this.cfg.entryPoint, c.userOpHash, c.payer, c.op.nonce, c.decoded);
+    if (outcome === undefined) return undefined;
+    return { ...located, outcome };
+  }
+
   /**
    * Whether the bundler holds this operation, queued or included (`eth_getUserOperationByHash`). Only an explicit
    * `null` result is absence. An error, including a bundler without the method, or an answer without a result, is
@@ -391,19 +414,93 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
     // The operation may already be on chain from an earlier attempt that timed out. It is reported to this
     // caller only if this facilitator claimed it before submitting; otherwise it was settled elsewhere, or its
     // record was lost, and reporting it again could serve a second request for one payment.
-    const lookUp = () => getOpReceipt(this.chain, c.userOpHash);
+    // A bundler reply blocks submission even when its receipt is incomplete.
+    let hasBundlerReceipt = false;
+    const bundles = new Map<string, OpReceipt>();
+    type Confirmation = Awaited<ReturnType<typeof this.confirmReceipt>>;
+    const checks = new Map<string, Promise<{ result: Confirmation }>>();
+    let confirmed: Confirmation;
+    const pollDeadline = () => Math.min(deadline, this.now() + Math.max(1, this.pollIntervalMs));
+    const lookUp = async () => {
+      const reported = await getOpReceipt(this.chain, c.userOpHash);
+      if (reported) hasBundlerReceipt = true;
+      if (reported?.transactionHash) {
+        const hash = reported.transactionHash.toLowerCase();
+        bundles.delete(hash);
+        bundles.set(hash, reported);
+        if (bundles.size > MAX_BUNDLE_CANDIDATES) {
+          const oldest = bundles.keys().next().value!;
+          bundles.delete(oldest);
+        }
+      }
+      return reported;
+    };
+    // Give each candidate a turn while keeping one receipt read in flight per hash.
+    const confirmBundle = async (hash: Hex, located: OpReceipt) => {
+      const key = hash.toLowerCase();
+      const completed = await this.within(pollDeadline(), () => {
+        let check = checks.get(key);
+        if (!check) {
+          check = this.confirmReceipt(c, located).catch(() => undefined).then((result) => ({ result }));
+          checks.set(key, check);
+          const pending = check;
+          void pending.then(({ result }) => {
+            if (result && !confirmed) confirmed = result;
+            if (!bundles.has(key) && checks.get(key) === pending) checks.delete(key);
+          });
+        }
+        return check;
+      });
+      if (completed) checks.delete(key);
+      return completed?.result;
+    };
     let receipt = await this.within(deadline, lookUp);
-    if (receipt && !this.store.isClaimed(c.userOpHash)) {
-      return this.fail("already_settled", "this operation is already on chain and was not submitted for this request", c.payer, receipt.transactionHash ?? "");
+    const alreadySettled = (hash: Hex) =>
+      this.fail("already_settled", "the bundler located this operation and the facilitator has no submission claim for it", c.payer, hash);
+    const initial = receipt;
+    if (initial?.transactionHash && !this.store.isClaimed(c.userOpHash)) return alreadySettled(initial.transactionHash);
+    if (initial?.transactionHash) confirmed = await confirmBundle(initial.transactionHash, initial);
+    if (initial && !confirmed) {
+      // The locator still blocks submission. Leave receipt recovery available to search the chain.
+      receipt = undefined;
     }
+    let recovered: OpReceipt | undefined;
+    let refresh: Promise<true> | undefined;
+    const refreshLocation = () => refresh ??= lookUp().then(() => true as const, () => true as const);
+    const pollBundles = async (): Promise<SettleResponse | undefined> => {
+      while (!confirmed && this.now() < deadline) {
+        const candidates = [...bundles.values()];
+        if (recovered?.transactionHash && !bundles.has(recovered.transactionHash.toLowerCase())) {
+          candidates.unshift(recovered);
+        }
+        for (const located of candidates) {
+          if (!located.transactionHash) continue;
+          if (!this.store.isClaimed(c.userOpHash)) return alreadySettled(located.transactionHash);
+          const result = await confirmBundle(located.transactionHash, located);
+          confirmed ??= result;
+          if (confirmed) break;
+        }
+        if (confirmed) break;
+        await this.pause(deadline);
+        // Refresh the location while also retrying known bundle receipts.
+        const refreshDeadline = hasBundlerReceipt || recovered ? pollDeadline() : deadline;
+        if (await this.within(refreshDeadline, refreshLocation)) refresh = undefined;
+      }
+      return undefined;
+    };
+    // A located but unconfirmed bundle can be re-bundled while history recovery is running.
+    let polling = initial?.transactionHash && !confirmed ? pollBundles() : undefined;
     // The answer when no receipt shows up in time. While this facilitator holds the claim, a retry can still find
     // the receipt, so that answer is always settle_timeout.
     const noReceipt = this.fail("settle_timeout", "no receipt within the settle window; resend the same payload", c.payer);
     if (!receipt) {
       let submit = true;
       try {
-        this.checkDeadline(c);
-        c = { ...c, ...(await withDeadline(this.checkChain(c, { rejectSettled: false }), deadline - this.now())) };
+        submit = !hasBundlerReceipt;
+        if (submit) {
+          this.checkDeadline(c);
+          c = { ...c, ...(await withDeadline(this.checkChain(c, { rejectSettled: false }), deadline - this.now())) };
+        }
       } catch (e) {
         if (e instanceof SettleDeadlineError) {
           this.log({ event: "settle_checks_timeout", hash: c.userOpHash });
@@ -415,7 +512,7 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
         if (!(await this.mayStillLand(c, v.invalidReason ?? "", deadline))) return this.fail(v.invalidReason ?? "unexpected_settle_error", v.invalidMessage ?? "", c.payer);
         submit = false;
       }
-      if (submit) {
+      if (submit && !hasBundlerReceipt && this.now() < deadline) {
         // Whether an earlier settle submitted it and lost the answer: a copy of it may then still be queued.
         const claimedBefore = this.store.isClaimed(c.userOpHash);
         try {
@@ -456,15 +553,16 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
         }
       }
     }
-    while (!receipt && this.now() < deadline) {
-      await this.pause(deadline);
-      receipt = await this.within(deadline, lookUp);
+    recovered = receipt ?? undefined;
+    const pollingResult = await (polling ??= pollBundles());
+    if (pollingResult) return pollingResult;
+    if (!confirmed) return noReceipt;
+    if (confirmed.outcome === "reverted") {
+      return remember(this.fail("userop_reverted", confirmed.reason ? this.revertReason(c.userOpHash, confirmed.reason) : "the operation reverted on chain", c.payer, confirmed.transactionHash ?? ""));
     }
-    if (!receipt) return noReceipt;
-
-    if (!receipt.success) {
-      return remember(this.fail("userop_reverted", receipt.reason ? this.revertReason(c.userOpHash, receipt.reason) : "the operation reverted on chain", c.payer, receipt.transactionHash ?? ""));
+    if (confirmed.outcome === "missing") {
+      return remember(this.fail("payment_transfer_missing", TRANSFER_MISSING, c.payer, confirmed.transactionHash ?? ""));
     }
-    return remember(succeeded(receipt.transactionHash));
+    return remember(succeeded(confirmed.transactionHash));
   }
 }

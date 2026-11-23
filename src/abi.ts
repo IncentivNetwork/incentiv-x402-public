@@ -5,6 +5,7 @@ export const erc20Abi = parseAbi([
   "function decimals() view returns (uint8)",
   "function symbol() view returns (string)",
   "function transfer(address to, uint256 amount) returns (bool)",
+  "event Transfer(address indexed from, address indexed to, uint256 value)",
 ]);
 
 export const entryPointAbi = parseAbi([
@@ -12,6 +13,8 @@ export const entryPointAbi = parseAbi([
   "function getNonce(address sender, uint192 key) view returns (uint256)",
   "function incrementNonce(uint192 key)",
   "function balanceOf(address account) view returns (uint256)",
+  "event BeforeExecution()",
+  "event UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster, uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)",
 ]);
 
 export const accountFactoryAbi = parseAbi([

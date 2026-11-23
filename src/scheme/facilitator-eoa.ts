@@ -8,6 +8,8 @@ import { MemoryStore, type SettledStore } from "../facilitator/store.js";
 import { makeChain, nonceRefusal, refusedOnSubmit, SettleDeadlineError, withDeadline, type Chain } from "../userop.js";
 import type { EoaPaymentPayload } from "./client-eoa.js";
 import type { FacilitatorOptions } from "./facilitator.js";
+import type { TransactionReceipt } from "viem";
+import { hasPaymentTransfer, TRANSFER_MISSING } from "../facilitator/settlement.js";
 
 const CLOCK_SKEW_SECONDS = 5;
 
@@ -55,7 +57,10 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
       // follows records it and reports it once. That is how a verify-first merchant recovers it.
       const claimed = this.store.isClaimed(d.txHash);
       const receipt = claimed ? await this.receipt(d.txHash) : undefined;
-      if (receipt?.status === "success") return { isValid: true, payer: d.sender };
+      if (receipt?.status === "success") {
+        if (!hasPaymentTransfer(receipt.logs, d.sender, d)) throw new PaymentError("payment_transfer_missing", TRANSFER_MISSING);
+        return { isValid: true, payer: d.sender };
+      }
       try {
         this.checkDeadline(d, requirements);
         await this.checkChain(d, { rejectSettled: true, rejectBusy: true });
@@ -227,11 +232,12 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
     // The whole settle, lookups, checks and submission included, fits in one window.
     const deadline = this.now() + this.settleTimeoutMs;
     const sender = d.sender.toLowerCase();
-    const outcome = (status: "success" | "reverted", hash: Hex): SettleResponse => {
-      const r =
-        status === "success"
-          ? ({ success: true, payer: d.sender, transaction: hash, network: NETWORK, amount: d.amount.toString() } as SettleResponse)
-          : this.fail("tx_reverted", "the transfer reverted on chain", d.sender, hash);
+    const outcome = (receipt: TransactionReceipt): SettleResponse => {
+      const hash = d.txHash;
+      let r: SettleResponse;
+      if (receipt.status !== "success") r = this.fail("tx_reverted", "the transfer reverted on chain", d.sender, hash);
+      else if (!hasPaymentTransfer(receipt.logs, d.sender, d)) r = this.fail("payment_transfer_missing", TRANSFER_MISSING, d.sender, hash);
+      else r = { success: true, payer: d.sender, transaction: hash, network: NETWORK, amount: d.amount.toString() };
       // A success is reported only once it is durably recorded, so one payment is never a success twice (SPEC 2.3).
       // If the write fails, the claim stays and resending the same payload records and reports it once storage works.
       try {
@@ -322,6 +328,6 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
       }
     }
     if (!receipt) return noReceipt;
-    return outcome(receipt.status, d.txHash);
+    return outcome(receipt);
   }
 }

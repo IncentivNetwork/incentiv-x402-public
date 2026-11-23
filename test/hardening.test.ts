@@ -14,10 +14,18 @@ import { CLAIM_TTL_MS, FileStore, MemoryStore, RESULT_TTL_MS } from "../src/faci
 import { checkPaysRequirements, logMessage, PaymentError, publicMessage } from "../src/decode.js";
 import { IncentivEoaTxFacilitatorScheme, IncentivUserOpFacilitatorScheme, MAINNET } from "../src/index.js";
 import { BundlerRpcError, bundlerRpc, nonceRefusal } from "../src/userop.js";
-import { HttpRequestError, RpcRequestError } from "viem";
+import { encodeAbiParameters, encodeEventTopics, HttpRequestError, RpcRequestError, zeroAddress, type Address, type Hex } from "viem";
+import { entryPointAbi, erc20Abi } from "../src/abi.js";
 
 const merchant = "0x832166144c59Ed3524878441fa67F91615d2133B";
 const req = (payTo = merchant) => ({ scheme: "incentiv-eoa-tx", network: "eip155:24101" as const, asset: MAINNET.usdc, amount: "1", payTo, maxTimeoutSeconds: 120, extra: {} });
+const payment: { token: Address; to: Address; amount: bigint } = { token: MAINNET.usdc, to: "0x0000000000000000000000000000000000000001", amount: 1n };
+const transferLog = ({ token, to, amount } = payment, from: Address = merchant) => ({
+  address: token,
+  topics: encodeEventTopics({ abi: erc20Abi, eventName: "Transfer", args: { from, to } }),
+  data: encodeAbiParameters([{ type: "uint256" }], [amount]),
+});
+const paidReceipt = { status: "success", logs: [transferLog()] };
 const bazaar = () => {
   const ext = declareDiscoveryExtension({ output: { example: { ok: true } } });
   (ext.bazaar as unknown as { info: { input: Record<string, unknown> } }).info.input.method = "GET";
@@ -490,8 +498,8 @@ test("a success is reported only once it is recorded; a resend reports it once s
   const logged: Record<string, unknown>[] = [];
   const s = new IncentivEoaTxFacilitatorScheme({ store, log: (l) => logged.push(l) });
   // The transaction is on chain, submitted by this facilitator (it holds the claim).
-  (s as unknown as { chain: unknown }).chain = { client: { getTransactionReceipt: async () => ({ status: "success" }) } };
-  const d = { txHash: hash, sender: merchant, amount: 1n };
+  (s as unknown as { chain: unknown }).chain = { client: { getTransactionReceipt: async () => paidReceipt } };
+  const d = { txHash: hash, sender: merchant, ...payment };
   const settleOnce = (s as unknown as { settleOnce(d: unknown, r: unknown): Promise<{ success: boolean; errorReason?: string }> }).settleOnce.bind(s);
   const first = await settleOnce(d, req());
   assert.equal(first.success, false);
@@ -711,20 +719,28 @@ async function fakeBundler(receipt: unknown) {
       const { id, method } = JSON.parse(body) as { id: number; method: string };
       methods.push(method);
       res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ jsonrpc: "2.0", id, result: receipt }));
+      res.end(JSON.stringify({ jsonrpc: "2.0", id, result: typeof receipt === "function" ? receipt(method) : receipt }));
     });
   });
   await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
   return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, close: () => server.close(), methods };
 }
 
-const opHash = `0x${"cd".repeat(32)}`;
+const opHash: Hex = `0x${"cd".repeat(32)}`;
+const beforeExecution = { address: MAINNET.entryPoint, topics: encodeEventTopics({ abi: entryPointAbi, eventName: "BeforeExecution" }), data: "0x" };
+const operationEvent = (userOpHash = opHash, success = true, sender: Address = merchant, nonce = 0n) => ({
+  address: MAINNET.entryPoint,
+  topics: encodeEventTopics({ abi: entryPointAbi, eventName: "UserOperationEvent", args: { userOpHash, sender, paymaster: zeroAddress } }),
+  data: encodeAbiParameters([{ type: "uint256" }, { type: "bool" }, { type: "uint256" }, { type: "uint256" }], [nonce, success, 0n, 0n]),
+});
 const userOpScheme = (store: MemoryStore, bundlerUrl: string, logged: Record<string, unknown>[] = []) => {
   const s = new IncentivUserOpFacilitatorScheme({ store, log: (l) => logged.push(l) });
   const op = { sender: merchant, nonce: 0n, callData: "0x", callGasLimit: 1n, verificationGasLimit: 1n, preVerificationGas: 1n, maxFeePerGas: 1n, maxPriorityFeePerGas: 1n, signature: "0x" };
-  const parsed = { op, userOpHash: opHash, decoded: { amount: 1n }, payer: merchant, validUntil: Math.floor(Date.now() / 1000) + 60, maxTimeoutSeconds: 120 };
+  const parsed = { op, userOpHash: opHash, decoded: payment, payer: merchant, validUntil: Math.floor(Date.now() / 1000) + 60, maxTimeoutSeconds: 120 };
   Object.assign(s, {
-    chain: { config: { ...MAINNET, bundlerUrl }, client: {} },
+    chain: { config: { ...MAINNET, bundlerUrl }, client: {
+      getTransactionReceipt: async () => ({ status: "success", logs: [beforeExecution, transferLog(), operationEvent()] }),
+    } },
     parse: () => parsed,
     checkChain: async () => parsed,
     nonceUsed: async () => false,
@@ -732,6 +748,543 @@ const userOpScheme = (store: MemoryStore, bundlerUrl: string, logged: Record<str
   return s;
 };
 const opPayload = { x402Version: 2, accepted: req(), payload: { userOpHash: opHash } };
+
+test("EOA settlement requires the exact USDC transfer", async () => {
+  const cases = [
+    [],
+    [transferLog({ ...payment, token: zeroAddress })],
+    [transferLog(payment, zeroAddress)],
+    [transferLog({ ...payment, to: zeroAddress })],
+    [transferLog({ ...payment, amount: 2n })],
+    [transferLog()],
+  ];
+  for (const [index, logs] of cases.entries()) {
+    const store = new MemoryStore();
+    const txHash = `0x${String(index + 1).repeat(64)}`;
+    const scheme = new IncentivEoaTxFacilitatorScheme({ store });
+    store.claim(txHash);
+    Object.assign(scheme, {
+      parse: async () => ({ txHash, sender: merchant, ...payment }),
+      chain: { client: { getTransactionReceipt: async () => ({ status: "success", logs }) } },
+    });
+    const valid = index === cases.length - 1;
+    assert.equal((await scheme.verify({} as never, req())).isValid, valid);
+    const result = await scheme.settle({} as never, req());
+    assert.equal(result.success, valid);
+    assert.equal(result.errorReason, valid ? undefined : "payment_transfer_missing");
+  }
+});
+
+test("user operation settlement uses only its own execution logs and requires a successful event", async () => {
+  const otherHash: Hex = `0x${"ef".repeat(32)}`;
+  const bundleHash = `0x${"11".repeat(32)}`;
+  const bundler = await fakeBundler({ success: true, receipt: { transactionHash: bundleHash } });
+  try {
+    const transfer = transferLog();
+    const cases = [
+      { logs: [transfer, beforeExecution, operationEvent()], reason: "payment_transfer_missing" },
+      { logs: [beforeExecution, transfer, operationEvent(otherHash), operationEvent()], reason: "payment_transfer_missing" },
+      { logs: [beforeExecution, operationEvent(), transfer, operationEvent(otherHash)], reason: "payment_transfer_missing" },
+      { logs: [beforeExecution, transfer, operationEvent(opHash, false)], reason: "userop_reverted" },
+      { logs: [beforeExecution, operationEvent(otherHash), transfer, operationEvent()], reason: undefined },
+    ];
+    for (const { logs, reason } of cases) {
+      const store = new MemoryStore();
+      const scheme = userOpScheme(store, bundler.url);
+      store.claim(opHash);
+      Object.assign((scheme as unknown as { chain: { client: object } }).chain.client, {
+        getTransactionReceipt: async ({ hash }: { hash: Hex }) => {
+          assert.equal(hash, bundleHash);
+          return { status: "success", logs };
+        },
+      });
+      if (reason === "payment_transfer_missing") {
+        assert.equal((await scheme.verify(opPayload as never, req())).invalidReason, reason);
+      }
+      const result = await scheme.settle(opPayload as never, req());
+      assert.equal(result.errorReason, reason);
+      assert.equal(result.success, reason === undefined);
+    }
+  } finally {
+    bundler.close();
+  }
+});
+
+test("an unverified bundle keeps the claim until the operation's own receipt appears", async () => {
+  const transactionHash = `0x${"11".repeat(32)}`;
+  const bundler = await fakeBundler({ success: true, receipt: { transactionHash } });
+  try {
+    const transfer = transferLog();
+    const otherHash: Hex = `0x${"ef".repeat(32)}`;
+    const valid = { status: "success", logs: [beforeExecution, transfer, operationEvent()] };
+    const cases = [
+      { status: "reverted", logs: [] },
+      { status: "success", logs: [beforeExecution, transfer, operationEvent(otherHash)] },
+      { status: "success", logs: [beforeExecution, transfer, operationEvent(opHash, true, zeroAddress)] },
+      { status: "success", logs: [beforeExecution, transfer, operationEvent(opHash, true, merchant, 1n)] },
+      { status: "success", logs: [{ ...beforeExecution, address: zeroAddress }, transfer, operationEvent()] },
+      { status: "success", logs: [beforeExecution, transfer, { ...operationEvent(), address: zeroAddress }] },
+    ];
+    for (const candidate of cases) {
+      const store = new MemoryStore();
+      store.claim(opHash);
+      const scheme = userOpScheme(store, bundler.url);
+      let chainReceipt = candidate;
+      Object.assign(scheme, {
+        settleTimeoutMs: 150,
+        pollIntervalMs: 10,
+        checkChain: async () => { throw new PaymentError("nonce_used", "account nonce advanced"); },
+      });
+      Object.assign((scheme as unknown as { chain: { client: object } }).chain.client, {
+        getTransactionReceipt: async () => chainReceipt,
+      });
+      assert.equal((await scheme.settle(opPayload as never, req())).errorReason, "settle_timeout");
+      assert.equal(store.get(opHash), undefined);
+      assert.ok(store.isClaimed(opHash));
+      chainReceipt = valid;
+      assert.equal((await scheme.settle(opPayload as never, req())).success, true);
+      assert.equal((await scheme.settle(opPayload as never, req())).errorReason, "already_settled");
+    }
+  } finally {
+    bundler.close();
+  }
+});
+
+test("a located bundle blocks new claims and lets existing claims wait for chain confirmation", async () => {
+  const bundleHash: Hex = `0x${"11".repeat(32)}`;
+  let locations = 0;
+  const bundler = await fakeBundler(() => ++locations <= 2 ? { success: true, receipt: { transactionHash: bundleHash } } : null);
+  try {
+    const store = new MemoryStore();
+    const scheme = userOpScheme(store, bundler.url);
+    let reads = 0;
+    Object.assign(scheme, { settleTimeoutMs: 1_000, pollIntervalMs: 10 });
+    Object.assign((scheme as unknown as { chain: { client: object } }).chain.client, {
+      getTransactionReceipt: async ({ hash }: { hash: Hex }) => {
+        assert.equal(hash, bundleHash);
+        if (++reads < 3) throw new Error("chain receipt is not visible yet");
+        return { status: "success", logs: [beforeExecution, transferLog(), operationEvent()] };
+      },
+    });
+
+    const unclaimed = await scheme.settle(opPayload as never, req());
+    assert.equal(unclaimed.errorReason, "already_settled");
+    assert.equal(unclaimed.transaction, bundleHash);
+    assert.equal(reads, 0);
+    assert.equal(store.isClaimed(opHash), false);
+
+    store.claim(opHash);
+    assert.equal((await scheme.settle(opPayload as never, req())).success, true);
+    assert.equal(reads, 3);
+    assert.equal((await scheme.settle(opPayload as never, req())).errorReason, "already_settled");
+    assert.ok(!bundler.methods.includes("eth_sendUserOperation"));
+  } finally {
+    bundler.close();
+  }
+});
+
+test("verify-first recovery accepts an expired claimed operation while the chain receipt catches up", async () => {
+  const located = { success: true, receipt: { transactionHash: `0x${"11".repeat(32)}` } };
+  const bundler = await fakeBundler((method: string) => method === "eth_getUserOperationReceipt" ? located : null);
+  try {
+    const store = new MemoryStore();
+    const scheme = userOpScheme(store, bundler.url);
+    let visible = false;
+    Object.assign(scheme, { checkDeadline: () => { throw new PaymentError("payment_expired", "validUntil has passed"); } });
+    Object.assign((scheme as unknown as { chain: { client: object } }).chain.client, {
+      getTransactionReceipt: async () => {
+        if (!visible) throw new Error("receipt RPC is behind");
+        return { status: "success", logs: [beforeExecution, transferLog(), operationEvent()] };
+      },
+    });
+    assert.equal((await scheme.verify(opPayload as never, req())).invalidReason, "payment_expired");
+    store.claim(opHash);
+    assert.equal((await scheme.verify(opPayload as never, req())).isValid, true);
+    visible = true;
+    assert.equal((await scheme.settle(opPayload as never, req())).success, true);
+    assert.ok(!bundler.methods.includes("eth_sendUserOperation"));
+  } finally {
+    bundler.close();
+  }
+});
+
+test("verify does not treat malformed or reverted bundle locations as payment proof", async () => {
+  const validHash: Hex = `0x${"11".repeat(32)}`;
+  for (const [hash, status, expected] of [
+    ["17", "success", "payment_expired"],
+    ["not-a-hash", "success", "payment_expired"],
+    [validHash, "reverted", "payment_expired"],
+    [validHash, "unavailable", undefined],
+  ] as const) {
+    const bundler = await fakeBundler((method: string) => method === "eth_getUserOperationReceipt"
+      ? { success: false, receipt: { transactionHash: hash } } : null);
+    try {
+      const store = new MemoryStore();
+      store.claim(opHash);
+      const scheme = userOpScheme(store, bundler.url);
+      Object.assign(scheme, {
+        checkDeadline: () => { throw new PaymentError("payment_expired", "validUntil has passed"); },
+        mayStillLand: async () => false,
+      });
+      Object.assign((scheme as unknown as { chain: { client: object } }).chain.client, {
+        getTransactionReceipt: async () => {
+          if (status === "unavailable") throw new Error("chain RPC is behind");
+          return { status, logs: [] };
+        },
+      });
+      const response = await scheme.verify(opPayload as never, req());
+      assert.equal(response.invalidReason, expected);
+      assert.equal(response.isValid, expected === undefined);
+    } finally {
+      bundler.close();
+    }
+  }
+});
+
+test("verify keeps a claimed payment retryable when a stale bundle has no matching operation", async () => {
+  const bundleHash: Hex = `0x${"11".repeat(32)}`;
+  for (const chainReceipt of [
+    { status: "success", logs: [beforeExecution, operationEvent(`0x${"ef".repeat(32)}`)] },
+    { status: "success", logs: null },
+    { status: "reverted", logs: [] },
+  ]) {
+    const bundler = await fakeBundler((method: string) => method === "eth_getUserOperationReceipt"
+      ? { receipt: { transactionHash: bundleHash } } : null);
+    try {
+    const store = new MemoryStore();
+    store.claim(opHash);
+    const scheme = userOpScheme(store, bundler.url);
+    Object.assign(scheme, {
+      checkDeadline: () => { throw new PaymentError("payment_expired", "validUntil has passed"); },
+      mayStillLand: async () => true,
+    });
+    Object.assign((scheme as unknown as { chain: { client: object } }).chain.client, {
+      getTransactionReceipt: async () => chainReceipt,
+    });
+    assert.equal((await scheme.verify(opPayload as never, req())).isValid, true);
+    } finally {
+      bundler.close();
+    }
+  }
+});
+
+test("an incomplete operation receipt is rechecked without creating a claim", async () => {
+  const bundleHash = `0x${"11".repeat(32)}`;
+  let queries = 0;
+  const bundler = await fakeBundler((method: string) => {
+    if (method !== "eth_getUserOperationReceipt") return null;
+    return ++queries === 1 ? { success: true } : { success: true, receipt: { transactionHash: bundleHash } };
+  });
+  try {
+    const store = new MemoryStore();
+    const scheme = userOpScheme(store, bundler.url);
+    Object.assign(scheme, { settleTimeoutMs: 1_000, pollIntervalMs: 10 });
+    const result = await scheme.settle(opPayload as never, req());
+    assert.equal(result.errorReason, "already_settled");
+    assert.equal(result.transaction, bundleHash);
+    assert.equal(store.isClaimed(opHash), false);
+    assert.equal(store.get(opHash), undefined);
+    assert.ok(!bundler.methods.includes("eth_sendUserOperation"));
+  } finally {
+    bundler.close();
+  }
+});
+
+test("bundle refreshes retain a delayed result and do not overlap a stalled request", async () => {
+  const staleHash = `0x${"11".repeat(32)}`;
+  const currentHash = `0x${"22".repeat(32)}`;
+  for (const stalled of [false, true]) {
+    let queries = 0;
+    const server = createServer((request, response) => {
+      let body = "";
+      request.on("data", (chunk) => { body += chunk; });
+      request.on("end", () => {
+        const { id, method } = JSON.parse(body) as { id: number; method: string };
+        assert.equal(method, "eth_getUserOperationReceipt");
+        const reply = (transactionHash: string) => {
+          response.setHeader("content-type", "application/json");
+          response.end(JSON.stringify({ jsonrpc: "2.0", id, result: { receipt: { transactionHash } } }));
+        };
+        if (++queries === 1) reply(staleHash);
+        else if (!stalled) setTimeout(() => reply(currentHash), 100);
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const store = new MemoryStore();
+      store.claim(opHash);
+      const scheme = userOpScheme(store, `http://127.0.0.1:${(server.address() as AddressInfo).port}`);
+      Object.assign(scheme, { settleTimeoutMs: 2_000, pollIntervalMs: 65 });
+      let reads = 0;
+      Object.assign((scheme as unknown as { chain: { client: object } }).chain.client, {
+        getTransactionReceipt: async ({ hash }: { hash: Hex }) => {
+          reads++;
+          if (hash === currentHash || (stalled && reads >= 4)) {
+            return { status: "success", logs: [beforeExecution, transferLog(), operationEvent()] };
+          }
+          return { status: "reverted", logs: [] };
+        },
+      });
+      const result = await scheme.settle(opPayload as never, req());
+      assert.equal(result.success, true, stalled ? "confirmation can finish during a stalled refresh" : "consume the delayed hash");
+      assert.equal(result.transaction, stalled ? staleHash : currentHash);
+      assert.equal(queries, 2, "a pending or unread refresh is reused");
+    } finally {
+      server.close();
+      server.closeAllConnections();
+    }
+  }
+});
+
+test("bundle refreshes keep earlier candidates without letting a stalled receipt block a newer one", async () => {
+  const firstHash: Hex = `0x${"11".repeat(32)}`;
+  const nextHash: Hex = `0x${"22".repeat(32)}`;
+  for (const stalled of [false, true]) {
+    let lookups = 0;
+    const bundler = await fakeBundler((method: string) => {
+      assert.equal(method, "eth_getUserOperationReceipt");
+      return { receipt: { transactionHash: ++lookups === 1 ? firstHash : nextHash } };
+    });
+    try {
+      const store = new MemoryStore();
+      store.claim(opHash);
+      const scheme = userOpScheme(store, bundler.url);
+      Object.assign(scheme, { settleTimeoutMs: 1_500, pollIntervalMs: 20 });
+      const expected = stalled ? nextHash : firstHash;
+      let firstReads = 0;
+      Object.assign((scheme as unknown as { chain: { client: object } }).chain.client, {
+        getTransactionReceipt: async ({ hash }: { hash: Hex }) => {
+          if (hash === firstHash) {
+            firstReads++;
+            if (stalled) return new Promise(() => {});
+            if (lookups < 2) throw new Error("the first bundle receipt is not yet visible");
+          }
+          if (hash !== expected) return { status: "reverted", logs: [] };
+          return { status: "success", logs: [beforeExecution, transferLog(), operationEvent()] };
+        },
+      });
+      const result = await scheme.settle(opPayload as never, req());
+      assert.equal(result.success, true);
+      assert.equal(result.transaction, expected);
+      assert.ok(lookups >= 2, "a second bundle was reported");
+      if (stalled) assert.equal(firstReads, 1, "the pending read is reused");
+    } finally {
+      bundler.close();
+    }
+  }
+});
+
+test("a bundle reported again stays recent when the candidate cache fills", async () => {
+  const hashes = ["11", "22", "33", "44", "11", "55"].map<Hex>((byte) => `0x${byte.repeat(32)}`);
+  const [firstHash, evictedHash] = hashes;
+  let lookups = 0;
+  const bundler = await fakeBundler((method: string) => {
+    assert.equal(method, "eth_getUserOperationReceipt");
+    return { receipt: { transactionHash: hashes[Math.min(lookups++, hashes.length - 1)] } };
+  });
+  try {
+    const store = new MemoryStore();
+    store.claim(opHash);
+    const scheme = userOpScheme(store, bundler.url);
+    Object.assign(scheme, { settleTimeoutMs: 1_000, pollIntervalMs: 10 });
+    const checkedAfterEviction = new Set<Hex>();
+    Object.assign((scheme as unknown as { chain: { client: object } }).chain.client, {
+      getTransactionReceipt: async ({ hash }: { hash: Hex }) => {
+        if (lookups >= hashes.length) checkedAfterEviction.add(hash);
+        if (hash === firstHash && lookups >= hashes.length) {
+          return { status: "success", logs: [beforeExecution, transferLog(), operationEvent()] };
+        }
+        throw new Error("bundle receipt is not visible");
+      },
+    });
+    const result = await scheme.settle(opPayload as never, req());
+    assert.equal(result.success, true);
+    assert.equal(result.transaction, firstHash);
+    assert.ok(!checkedAfterEviction.has(evictedHash), "the least recently reported hash was evicted");
+  } finally {
+    bundler.close();
+  }
+});
+
+test("an evicted bundle keeps its pending receipt proof", async () => {
+  const hashes = ["11", "22", "33", "44", "55", "11"].map<Hex>((byte) => `0x${byte.repeat(32)}`);
+  let lookups = 0;
+  const bundler = await fakeBundler((method: string) => {
+    assert.equal(method, "eth_getUserOperationReceipt");
+    return { receipt: { transactionHash: hashes[Math.min(lookups++, hashes.length - 1)] } };
+  });
+  try {
+    const store = new MemoryStore();
+    store.claim(opHash);
+    const scheme = userOpScheme(store, bundler.url);
+    Object.assign(scheme, { settleTimeoutMs: 1_000, pollIntervalMs: 10 });
+    let firstReads = 0;
+    Object.assign((scheme as unknown as { chain: { client: object } }).chain.client, {
+      getTransactionReceipt: async ({ hash }: { hash: Hex }) => {
+        if (hash !== hashes[0]) throw new Error("receipt not visible");
+        if (++firstReads > 1) return new Promise(() => {});
+        while (lookups < hashes.length) await new Promise((resolve) => setTimeout(resolve, 1));
+        return { status: "success", logs: [beforeExecution, transferLog(), operationEvent()] };
+      },
+    });
+    const result = await scheme.settle(opPayload as never, req());
+    assert.equal(result.success, true);
+    assert.equal(result.transaction, hashes[0]);
+    assert.equal(firstReads, 1, "the original receipt request remains in flight");
+  } finally {
+    bundler.close();
+  }
+});
+
+test("a failed candidate cannot overwrite proof received during its receipt wait", async () => {
+  const hashes = ["11", "22", "33", "44", "55"].map<Hex>((byte) => `0x${byte.repeat(32)}`);
+  let lookups = 0;
+  const bundler = await fakeBundler((method: string) => {
+    assert.equal(method, "eth_getUserOperationReceipt");
+    return { receipt: { transactionHash: hashes[Math.min(lookups++, hashes.length - 1)] } };
+  });
+  try {
+    const store = new MemoryStore();
+    store.claim(opHash);
+    const scheme = userOpScheme(store, bundler.url);
+    Object.assign(scheme, { settleTimeoutMs: 800, pollIntervalMs: 10 });
+    let resolveFirst: ((receipt: unknown) => void) | undefined;
+    Object.assign((scheme as unknown as { chain: { client: object } }).chain.client, {
+      getTransactionReceipt: async ({ hash }: { hash: Hex }) => {
+        if (hash === hashes[0]) return new Promise((resolve) => { resolveFirst = resolve; });
+        if (hash === hashes[4]) {
+          setTimeout(() => resolveFirst?.({ status: "success", logs: [beforeExecution, transferLog(), operationEvent()] }), 1);
+          await new Promise((resolve) => setTimeout(resolve, 30));
+        }
+        throw new Error("receipt not visible");
+      },
+    });
+    const result = await scheme.settle(opPayload as never, req());
+    assert.equal(result.success, true, result.errorReason);
+    assert.equal(result.transaction, hashes[0]);
+  } finally {
+    bundler.close();
+  }
+});
+
+test("pending bundle proof survives a long EntryPoint history search", async (t) => {
+  const hash: Hex = `0x${"11".repeat(32)}`;
+  const store = new MemoryStore();
+  if (!("claimForSubmission" in store) || typeof store.claimForSubmission !== "function") {
+    t.skip("Requires the submitted-claim history recovery flow");
+    return;
+  }
+  store.claimForSubmission(opHash);
+  const bundler = await fakeBundler((method: string) => method === "eth_getUserOperationReceipt"
+    ? { receipt: { transactionHash: hash } } : null);
+  try {
+    const scheme = userOpScheme(store, bundler.url);
+    Object.assign(scheme, {
+      settleTimeoutMs: 250, pollIntervalMs: 20, nonceUsed: async () => true,
+      operationHistory: { find: async () => new Promise((resolve) => setTimeout(() => resolve(undefined), 400)) },
+    });
+    Object.assign((scheme as unknown as { chain: { client: object } }).chain.client, {
+      getTransactionReceipt: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return { status: "success", logs: [beforeExecution, transferLog(), operationEvent()] };
+      },
+    });
+    const response = await scheme.settle(opPayload as never, req());
+    assert.equal(response.success, true, response.errorReason);
+  } finally {
+    bundler.close();
+  }
+});
+
+test("bundle location refreshes during EntryPoint history search", async (t) => {
+  const store = new MemoryStore();
+  if (!("claimForSubmission" in store) || typeof store.claimForSubmission !== "function") {
+    t.skip("Requires the submitted-claim history recovery flow");
+    return;
+  }
+  store.claimForSubmission(opHash);
+  const staleHash: Hex = `0x${"11".repeat(32)}`;
+  const paidHash: Hex = `0x${"22".repeat(32)}`;
+  let lookups = 0;
+  const bundler = await fakeBundler((method: string) => method === "eth_getUserOperationReceipt"
+    ? { receipt: { transactionHash: ++lookups === 1 ? staleHash : paidHash } } : null);
+  try {
+    const scheme = userOpScheme(store, bundler.url);
+    Object.assign(scheme, {
+      settleTimeoutMs: 300, pollIntervalMs: 20, nonceUsed: async () => true,
+      operationHistory: { find: async () => new Promise((resolve) => setTimeout(() => resolve(undefined), 450)) },
+    });
+    Object.assign((scheme as unknown as { chain: { client: object } }).chain.client, {
+      getTransactionReceipt: async ({ hash }: { hash: Hex }) => hash === staleHash
+        ? { status: "reverted", logs: [] }
+        : { status: "success", logs: [beforeExecution, transferLog(), operationEvent()] },
+    });
+    const response = await scheme.settle(opPayload as never, req());
+    assert.equal(response.success, true, response.errorReason);
+    assert.equal(response.transaction, paidHash);
+    assert.ok(lookups >= 2);
+  } finally {
+    bundler.close();
+  }
+});
+
+test("nonce recovery records a replacement when a stale bundle is followed by explicit absence", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "x402-stale-bundle-"));
+  const path = join(dir, "settled.json");
+  let bundler: Awaited<ReturnType<typeof fakeBundler>> | undefined;
+  try {
+    const store = new FileStore(path);
+    if (!("claimForSubmission" in store) || typeof store.claimForSubmission !== "function" ||
+        !("nonceUsedPastGrace" in store) || typeof store.nonceUsedPastGrace !== "function") {
+      t.skip("Requires the submission claim and EntryPoint history recovery flow");
+      return;
+    }
+    store.claimForSubmission(opHash);
+    assert.equal(store.nonceUsedPastGrace(opHash, true, Date.now() - 180_000), false);
+
+    const staleHash: Hex = `0x${"11".repeat(32)}`;
+    let lookups = 0;
+    bundler = await fakeBundler((method: string) => {
+      assert.equal(method, "eth_getUserOperationReceipt");
+      return ++lookups === 1 ? { success: false, receipt: { transactionHash: staleHash } } : null;
+    });
+    const scheme = userOpScheme(store, bundler.url);
+    const genesisHash: Hex = `0x${"22".repeat(32)}`;
+    const headHash: Hex = `0x${"33".repeat(32)}`;
+    const timestamp = BigInt(Math.floor(Date.now() / 1000));
+    let exactBlockChecked = false;
+    Object.assign(scheme, { settleTimeoutMs: 1_000, pollIntervalMs: 10, nonceUsed: async () => true });
+    Object.assign((scheme as unknown as { chain: { client: object } }).chain.client, {
+      getTransactionReceipt: async ({ hash }: { hash: Hex }) => {
+        assert.equal(hash, staleHash);
+        return { status: "reverted", logs: [] };
+      },
+      getBlock: async ({ blockNumber }: { blockNumber?: bigint }) => blockNumber === 0n
+        ? { number: 0n, hash: genesisHash, parentHash: `0x${"00".repeat(32)}`, timestamp: timestamp - 3_600n }
+        : { number: 1n, hash: headHash, parentHash: genesisHash, timestamp },
+      readContract: async () => 1n,
+      getLogs: async ({ blockHash, args }: { blockHash?: Hex; args: { userOpHash: Hex } }) => {
+        assert.equal(args.userOpHash, opHash);
+        if (blockHash) {
+          assert.equal(blockHash, headHash);
+          exactBlockChecked = true;
+        }
+        return [];
+      },
+    });
+
+    const response = await scheme.settle(opPayload as never, req());
+    assert.equal(response.errorReason, "nonce_used");
+    assert.ok(lookups >= 2);
+    assert.ok(exactBlockChecked, "the history search proved absence at the canonical block");
+    const reloaded = new FileStore(path);
+    assert.equal(reloaded.isClaimed(opHash), false);
+    assert.equal(reloaded.get(opHash)?.errorReason, "nonce_used");
+  } finally {
+    bundler?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("user operations: a success is reported only once recorded, and a resend recovers it", async () => {
   const bundler = await fakeBundler({ success: true, receipt: { transactionHash: `0x${"11".repeat(32)}` } });
@@ -801,6 +1354,9 @@ test("verify accepts a payment this facilitator submitted and saw succeed, so a 
   try {
     const store = new MemoryStore();
     const s = userOpScheme(store, reverted.url);
+    Object.assign((s as unknown as { chain: { client: object } }).chain.client, {
+      getTransactionReceipt: async () => ({ status: "success", logs: [beforeExecution, operationEvent(opHash, false)] }),
+    });
     Object.assign(s, { checkChain: async () => { throw new PaymentError("nonce_used", "account nonce is 1, operation uses 0"); } });
     store.claim(opHash);
     assert.equal((await s.verify(opPayload as never, req() as never)).invalidReason, "nonce_used", "a reverted one is not accepted");
@@ -810,10 +1366,10 @@ test("verify accepts a payment this facilitator submitted and saw succeed, so a 
   // EOA transfers.
   const store = new MemoryStore();
   const e = new IncentivEoaTxFacilitatorScheme({ store, log: () => {} });
-  const d = { txHash: `0x${"ef".repeat(32)}`, sender: merchant, amount: 1n, validUntil: Math.floor(Date.now() / 1000) + 60 };
+  const d = { txHash: `0x${"ef".repeat(32)}`, sender: merchant, ...payment, validUntil: Math.floor(Date.now() / 1000) + 60 };
   let status = "success";
   Object.assign(e, {
-    chain: { client: { getTransactionReceipt: async () => ({ status }) } },
+    chain: { client: { getTransactionReceipt: async () => ({ ...paidReceipt, status }) } },
     parse: async () => d,
     checkChain: async () => { throw new PaymentError("nonce_used", "account nonce is 1, transaction uses 0"); },
   });
@@ -1231,7 +1787,7 @@ test("EOA: a lost submission response keeps the claim, and the retry reports the
     checkChain: async () => {},
   });
   const settleOnce = (e as unknown as { settleOnce(d: unknown, r: unknown): Promise<{ success: boolean; errorReason?: string }> }).settleOnce.bind(e);
-  const tx = (n: number) => ({ txHash: `0x${n.toString(16).padStart(64, "0")}`, sender: merchant, amount: 1n, nonce: 0, validUntil: Math.floor(Date.now() / 1000) + 60 });
+  const tx = (n: number) => ({ txHash: `0x${n.toString(16).padStart(64, "0")}`, sender: merchant, ...payment, nonce: 0, validUntil: Math.floor(Date.now() / 1000) + 60 });
   const rpcError = (code: number, message: string) => new RpcRequestError({ body: {}, error: { code, message }, url: "http://rpc.example" });
 
   // The node took the transaction but the reply was lost.
@@ -1240,7 +1796,7 @@ test("EOA: a lost submission response keeps the claim, and the retry reports the
   assert.equal((await settleOnce(d, req())).errorReason, "settle_timeout");
   assert.ok(store.isClaimed(d.txHash), "the claim is kept");
   assert.ok(logged.some((l) => l.event === "submit_unknown"));
-  receipt = { status: "success" };
+  receipt = paidReceipt;
   assert.equal((await settleOnce(d, req())).success, true, "the retry reconciles the same hash");
   receipt = undefined;
 
@@ -1289,7 +1845,7 @@ test("EOA: a lost submission response keeps the claim, and the retry reports the
   // A resend refused with "nonce too low" because the first send landed: the receipt is reported, once.
   const landed = tx(4);
   sendError = rpcError(-32000, "nonce too low");
-  receipt = { status: "success" };
+  receipt = paidReceipt;
   let submitted = false;
   Object.assign((e as unknown as { chain: { client: object } }).chain.client, {
     // No receipt before the submission; the refused resend finds it.
@@ -1307,7 +1863,7 @@ test("EOA: a lost submission response keeps the claim, and the retry reports the
   count = 1;
   assert.equal((await settleOnce(lagging, req())).errorReason, "settle_timeout", "retryable: the claim is held");
   assert.ok(store.isClaimed(lagging.txHash), "the claim is kept");
-  receipt = { status: "success" };
+  receipt = paidReceipt;
   assert.equal((await settleOnce(lagging, req())).success, true, "and a retry reports it once it is visible");
 });
 
@@ -1322,7 +1878,7 @@ test("a retry of a claimed payment whose nonce is used waits for its receipt ins
   Object.assign(e, {
     chain: { client: {
       // Visible only from the fourth lookup on: the retry's first lookup misses it.
-      getTransactionReceipt: async () => { if (++lookups < 4) throw new Error("not found"); return { status: "success" }; },
+      getTransactionReceipt: async () => { if (++lookups < 4) throw new Error("not found"); return paidReceipt; },
       getTransactionCount: async () => 1,
       sendRawTransaction: async () => { resent = true; },
     } },
@@ -1330,7 +1886,7 @@ test("a retry of a claimed payment whose nonce is used waits for its receipt ins
     checkChain: async () => { throw new PaymentError("nonce_used", "account nonce is 1, transaction uses 0"); },
   });
   const settleOnce = (e as unknown as { settleOnce(d: unknown, r: unknown): Promise<{ success: boolean; errorReason?: string }> }).settleOnce.bind(e);
-  const d = { txHash: `0x${"a1".repeat(32)}`, sender: merchant, amount: 1n, nonce: 0 };
+  const d = { txHash: `0x${"a1".repeat(32)}`, sender: merchant, ...payment, nonce: 0 };
   assert.equal((await settleOnce(d, req())).errorReason, "nonce_used", "not claimed here: refused at once");
   assert.equal(lookups, 1);
   lookups = 0;
@@ -1430,6 +1986,7 @@ test("a submission that never answers ends within the settle window, with the cl
 test("user operations: a lost submission response keeps the claim, and the retry reports the receipt once", async () => {
   let mode: "drop" | "refuse" | "refuse400" | "http400" | "http502" | "json502" | "json408" | "stringCode" = "drop";
   let receipt: unknown = null;
+  let locateAfterRefusal = false;
   const server = createServer((r, res) => {
     let body = "";
     r.on("data", (c) => (body += c));
@@ -1438,6 +1995,7 @@ test("user operations: a lost submission response keeps the claim, and the retry
       if (method === "eth_sendUserOperation" && mode === "drop") return void res.socket?.destroy();
       res.setHeader("content-type", "application/json");
       if (method === "eth_sendUserOperation") {
+        if (locateAfterRefusal) receipt = { success: true, receipt: { transactionHash: `0x${"11".repeat(32)}` } };
         const refusal = JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32500, message: "AA21 didn't pay prefund" } });
         if (mode === "refuse") return void res.end(refusal);
         if (mode === "refuse400") return void res.writeHead(400).end(refusal);
@@ -1446,6 +2004,9 @@ test("user operations: a lost submission response keeps the claim, and the retry
         if (mode === "json502") return void res.writeHead(502).end(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message: "upstream bundler unavailable" } }));
         if (mode === "stringCode") return void res.end(JSON.stringify({ jsonrpc: "2.0", id, error: { code: "-32500", message: "AA21 didn't pay prefund" } }));
         return void res.writeHead(502).end("Bad Gateway");
+      }
+      if (method === "eth_getUserOperationByHash" && locateAfterRefusal) {
+        return void res.end(JSON.stringify({ jsonrpc: "2.0", id, result: null }));
       }
       res.end(JSON.stringify({ jsonrpc: "2.0", id, result: receipt }));
     });
@@ -1479,6 +2040,24 @@ test("user operations: a lost submission response keeps the claim, and the retry
       if (m !== "http400") assert.match(r.errorMessage ?? "", /AA21/, "the bundler's reason reaches the merchant");
       assert.ok(!other.isClaimed(opHash));
     }
+    const located = new MemoryStore();
+    located.claim(opHash);
+    const recovering = userOpScheme(located, url);
+    let chainReads = 0;
+    Object.assign(recovering, { settleTimeoutMs: 1_000, pollIntervalMs: 10 });
+    Object.assign((recovering as unknown as { chain: { client: object } }).chain.client, {
+      getTransactionReceipt: async () => {
+        if (++chainReads < 3) throw new Error("chain receipt is not visible yet");
+        return { status: "success", logs: [beforeExecution, transferLog(), operationEvent()] };
+      },
+    });
+    mode = "refuse";
+    locateAfterRefusal = true;
+    assert.equal((await recovering.settle(opPayload as never, req())).success, true);
+    assert.equal(chainReads, 3);
+    locateAfterRefusal = false;
+    receipt = null;
+
     // A 5xx status is not an answer.
     const gateway = new MemoryStore();
     const g = userOpScheme(gateway, url);
@@ -2221,7 +2800,7 @@ test("EOA: a nonce refusal, or a refused resend, keeps the claim even when the r
     checkChain: async () => {},
   });
   const settleOnce = (e as unknown as { settleOnce(d: unknown, r: unknown): Promise<{ success: boolean; errorReason?: string }> }).settleOnce.bind(e);
-  const tx = (n: number) => ({ txHash: `0x${n.toString(16).padStart(64, "0")}`, sender: merchant, amount: 1n, nonce: 0, validUntil: Math.floor(Date.now() / 1000) + 60 });
+  const tx = (n: number) => ({ txHash: `0x${n.toString(16).padStart(64, "0")}`, sender: merchant, ...payment, nonce: 0, validUntil: Math.floor(Date.now() / 1000) + 60 });
   const rpcError = (message: string) => new RpcRequestError({ body: {}, error: { code: -32000, message }, url: "http://rpc.example" });
 
   // An up-to-date node says "nonce too low"; the reads reach a node that has not seen the payment yet.
@@ -2229,7 +2808,7 @@ test("EOA: a nonce refusal, or a refused resend, keeps the claim even when the r
   sendError = rpcError("nonce too low");
   assert.equal((await settleOnce(landed, req())).errorReason, "settle_timeout");
   assert.ok(store.isClaimed(landed.txHash), "the claim is kept");
-  receipt = { status: "success" };
+  receipt = paidReceipt;
   assert.equal((await settleOnce(landed, req())).success, true, "and the retry reports it once the receipt is visible");
   receipt = undefined;
 

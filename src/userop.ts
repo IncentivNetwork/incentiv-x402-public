@@ -333,10 +333,12 @@ export async function getOpReceipt(chain: Chain, userOpHash: Hex): Promise<OpRec
   const r = (await bundlerRpc(chain, "eth_getUserOperationReceipt", [userOpHash])) as Record<string, unknown> | null;
   if (!r) return undefined;
   const receipt = (r.receipt ?? {}) as Record<string, unknown>;
+  const rawTransactionHash = receipt.transactionHash ?? r.transactionHash;
   return {
     userOpHash,
     success: r.success === true || r.success === "0x1" || r.success === "true",
-    transactionHash: (receipt.transactionHash ?? r.transactionHash) as Hex | undefined,
+    transactionHash: typeof rawTransactionHash === "string" && /^0x[0-9a-fA-F]{64}$/.test(rawTransactionHash)
+      ? rawTransactionHash as Hex : undefined,
     blockNumber: receipt.blockNumber !== undefined ? String(receipt.blockNumber) : undefined,
     reason: typeof r.reason === "string" ? r.reason : undefined,
   };

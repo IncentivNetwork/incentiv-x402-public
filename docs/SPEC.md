@@ -43,7 +43,9 @@ A settle that ended in `settle_timeout` is not final: retrying the same payload 
 
 The claim is released only when the RPC or bundler definitely refused the payment **and** the chain shows neither a receipt for the payment nor its nonce used (for an EOA transfer, counting the node's pending transactions; for a user operation, the bundler must not report it either, queued or included, through `eth_getUserOperationByHash`, where only an explicit `null` result means it does not; when the lookup gives no such answer (an error, a bundler without the method, an answer without a result) and an earlier settle already submitted the operation, the claim is kept, since that copy may still be queued). A definite refusal is a JSON-RPC error other than an internal error (`-32603`) sent with a 2xx or 4xx status other than 408, or an HTTP 4xx status other than 408; a 408 or 5xx status is never a refusal, whatever its body says. From the RPC, answers about the node rather than the payment (HTTP 403, 408, 413, 429 and 5xx; JSON-RPC `-1`, `-32005`, `429` and `-32603`) are not refusals. A payment is sent once per settle, but a settle retried after `settle_timeout` sends it again, and that resend can be refused because the first copy landed or is still pending. So for an EOA transfer, a nonce refusal (`nonce too low` and similar wordings), or any refusal of a resend after an earlier settle submitted the payment, keeps the claim without relying on a read: behind a load-balanced RPC, the receipt and nonce reads can reach a node that has not seen the payment yet. A payment kept this way that never lands is answered `payment_expired` once its deadline has passed and its nonce reads unused; if another transaction from the payer used the nonce, the answer stays `settle_timeout` until the claim expires after 1 hour. If the nonce is used without a receipt, the claim is kept, the receipt is awaited, and the answer without one is `settle_timeout`. If the submission got no answer (a lost connection, a timeout, a 5xx status or an internal error), the payment may have been accepted. The claim is kept, the facilitator waits for the receipt as usual, and a `settle_timeout` is retried with the same payload. If the payment did land, the retry reports it once. If it did not, the retry submits it again.
 
-A settle takes at most the settle window (60 seconds), from its first receipt lookup to its answer: every lookup, check, submission and poll is bounded by it. Checks that have not finished by the end of the window answer `settle_timeout` with nothing submitted, and a submission that has not answered by then counts as no answer.
+A settle has a single 60-second window for checks, submission and polling. If the checks run out of time, the facilitator answers `settle_timeout` before submitting. A submission that has not answered by the end of the window counts as no answer.
+
+**Result persistence.** A confirmed execution without the required USDC log returns `payment_transfer_missing` even if the result cannot be recorded. The claim then keeps its original lifetime.
 
 A success is reported only after it is durably recorded. If storage fails after the payment executed, the answer is `settle_unrecorded`; the claim is kept for 7 days (as long as a result) instead of 1 hour, and retrying the same payload reports the success once storage works. (A restart before storage works loses that extension, and the 1-hour claim limit applies again.) A failure that cannot be recorded (`tx_reverted`, `userop_reverted`) is answered as is and its claim keeps the 1-hour limit. Because the payment's nonce is used by then, `/verify` accepts a payload whose claim this facilitator holds and whose payment executed successfully, skipping the chain checks, and also one whose claim it holds and that may still land by the rules above (no receipt yet, and its nonce used, or its deadline passed without the payment shown absent); the settle that follows waits for the receipt and never submits it again, so a merchant that verifies before every settle can retry it too (the same applies after `settle_timeout`). If the claim itself cannot be recorded, the answer is `store_unavailable` and nothing is submitted.
 
@@ -100,7 +102,8 @@ Checks run in this order and stop at the first failure.
 
 | Outcome | Response |
 | --- | --- |
-| Receipt with status success | `success: true`, `transaction` = the transaction hash, `payer`, `amount` |
+| Successful receipt with a USDC `Transfer(payer, payTo, amount)` log | `success: true`, `transaction` = the transaction hash, `payer`, `amount` |
+| Successful receipt without the exact USDC transfer log | `success: false`, `payment_transfer_missing` |
 | Receipt with status reverted | `success: false`, `tx_reverted` |
 | The RPC refuses the transaction (a JSON-RPC error, or a 4xx status, that is not transient; 2.3) on its first submission, not for its nonce, and the chain shows neither its receipt nor its nonce used, pending included | `success: false`, `tx_rejected`; the claim is released |
 | The RPC refuses it, but its receipt exists | The receipt is reported as above |
@@ -162,17 +165,21 @@ The payer is an Incentiv smart account controlled by an owner EOA. It pays with 
 
 1. If the operation already has a receipt, report its outcome when this facilitator holds the claim (2.3), and `already_settled` otherwise.
 2. Otherwise check the deadline, repeat checks 8 to 13, record the claim, and submit it with `eth_sendUserOperation`.
-3. Wait for `eth_getUserOperationReceipt` until 60 seconds after step 1 started. Inclusion alone is not success: the receipt's `success` must be true.
+3. Use `eth_getUserOperationReceipt` to locate the bundle, then read the transaction receipt from the chain RPC within 60 seconds after step 1 started. An operation receipt requires a matching EntryPoint `UserOperationEvent` in a successful bundle. The event's `success` determines whether the operation reverted. For success, the exact USDC `Transfer(payer, payTo, amount)` log must appear after the preceding EntryPoint `UserOperationEvent` (or `BeforeExecution` for the first operation) and before the operation's own event.
 
 | Outcome | Response |
 | --- | --- |
-| Receipt with `success: true` | `success: true`, `transaction` = the bundle transaction hash, `payer` = the account, `amount` |
+| Successful operation with the exact USDC transfer log in its execution | `success: true`, `transaction` = the bundle transaction hash, `payer` = the account, `amount` |
+| Successful operation without the exact USDC transfer log | `success: false`, `payment_transfer_missing` |
 | Receipt with `success: false` | `success: false`, `userop_reverted` |
 | The bundler refuses the operation (a JSON-RPC error, with any HTTP status, or a 4xx status), does not hold it, and the chain shows neither its receipt nor its nonce used | `success: false`, `userop_rejected`; the claim is released |
 | The bundler refuses it, but its receipt exists | The receipt is reported as above |
 | The bundler refuses it, but still holds it (`eth_getUserOperationByHash`), or the account's nonce is used, without a receipt | The claim is kept and the receipt is awaited; without one, `settle_timeout` |
 | No answer to the submission (2.3) | The claim is kept and the receipt is awaited as above |
 | No receipt within 60 seconds | `success: false`, `settle_timeout` |
+| Reverted bundle or no matching operation event | The facilitator keeps polling for a matching EntryPoint `UserOperationEvent` and answers `settle_timeout` if the window ends. Only a matching event with `success: false` establishes `userop_reverted` |
+| The bundler locates a bundle before the chain RPC confirms the operation | With a prior claim, the facilitator checks recent bundle candidates until one is confirmed or the window ends with `settle_timeout`. Without a claim, it answers `already_settled` |
+| The bundler returns an operation receipt without a bundle hash | The facilitator rechecks the lookup without creating a claim or resubmitting |
 
 ## 5. Facilitator HTTP API
 
@@ -218,6 +225,7 @@ A payer can make an unsettled payment unusable before its deadline passes:
 | `settle_timeout` | No receipt within 60 seconds (the payment may have been submitted), or the checks did not finish in time (nothing was submitted); retry the same payload |
 | `tx_rejected`, `tx_reverted` | The RPC rejected the transaction, or it reverted |
 | `userop_rejected`, `userop_reverted` | The bundler rejected the operation, or it reverted |
+| `payment_transfer_missing` | The receipt does not prove the exact USDC transfer for this payment |
 | `settle_unrecorded` | The payment executed but could not be recorded; retry the same payload (2.3) |
 | `store_unavailable` | The facilitator cannot record claims; nothing was submitted |
 | `unexpected_verify_error`, `unexpected_settle_error` | An internal error |
