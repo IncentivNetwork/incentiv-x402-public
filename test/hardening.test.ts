@@ -2155,6 +2155,20 @@ test("verify keeps a claimed payment that may still land valid, in both schemes,
   assert.equal((await e.verify({} as never, req() as never)).invalidReason, "payment_expired", "nonce unused: final");
 });
 
+test("a self-payment refused at the payTo limit cannot help a waiting listing earn admission", () => {
+  const c = new Catalog(undefined, () => Date.parse("2026-11-20T00:00:00Z"));
+  for (let i = 0; i < CATALOG_LIMITS.maxEntriesPerPayTo; i++) {
+    c.record(payload(`https://incumbent.example/${i}`) as never, { ...req(), amount: "10" }, undefined, addr(1 + i));
+  }
+  const url = "https://api.merchant.example/waiting";
+  const route = { ...req(), amount: "6" };
+  assert.equal(c.record(payload(url) as never, route, undefined, route.payTo).rejectedReason, "no room for this payTo");
+  const pending = (c as unknown as { pending: Map<string, unknown> }).pending;
+  assert.equal(pending.size, 0, "the refused self-payment adds no waiting entry or version score");
+  assert.equal(c.record(payload(url) as never, route, undefined, addr(9_001)).rejectedReason, "no room for this payTo");
+  assert.equal(c.record(payload(url) as never, route, undefined, addr(9_002)).status, "success");
+});
+
 test("self-payments refused by a full catalog are not remembered, and the least paid waiting entry goes first", () => {
   const c = new Catalog(undefined, () => Date.parse("2026-11-20T00:00:00Z"));
   // The merchant's payTo is full of listings paid 10 units each; the rest of the catalog is full too.
