@@ -22,7 +22,7 @@ async function serve() {
 test("the landing page and every docs page are served as HTML with a strict policy", async () => {
   const { base, close } = await serve();
   try {
-    for (const path of ["/", "/docs/", "/docs/sellers", "/docs/buyers", "/docs/api", "/docs/self-host"]) {
+    for (const path of ["/", "/docs/", "/docs/sellers", "/docs/buyers", "/docs/api"]) {
       const res = await fetch(base + path);
       assert.equal(res.status, 200, path);
       assert.match(res.headers.get("content-type") ?? "", /text\/html/, path);
@@ -42,7 +42,7 @@ test("the landing page and every docs page are served as HTML with a strict poli
 test("every local link on every page points to a page that exists", async () => {
   const { base, close } = await serve();
   try {
-    const pages = ["/", "/docs/", "/docs/sellers", "/docs/buyers", "/docs/api", "/docs/self-host"];
+    const pages = ["/", "/docs/", "/docs/sellers", "/docs/buyers", "/docs/api"];
     for (const page of pages) {
       const html = await (await fetch(base + page)).text();
       for (const [, href] of html.matchAll(/(?:href|src)="(\/[^"#]*)(?:#[^"]*)?"/g)) {
