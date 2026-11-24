@@ -64,9 +64,13 @@ Protect `main` with PR review and restrict the GitHub `prod` environment to the 
 
 Set `AWS_ROLE_ARN`, `AWS_REGION`, `ECR_REPOSITORY`, `EKS_CLUSTER`, `K8S_NAMESPACE`, `K8S_DEPLOYMENT` and `K8S_CONTAINER` as variables in `prod`. Push a `vX.Y.Z` tag on a commit already on `main`. Run **Deploy facilitator** from `main` in GitHub Actions with that tag, or use `gh workflow run deploy.yml --ref main -f tag=vX.Y.Z`. The workflow tests the tagged commit using the current CI matrix before building or reusing the immutable image and deploying by digest. Tag creation by itself does not start a release.
 
+This workflow releases code already on `main`. For fixes under coordinated disclosure, deploy the verified build privately before publishing the source and retain the commit and image digest for verification at publication.
+
 The release workflow records the tested Git commit and the digest reported by Buildx in AWS Systems Manager Parameter Store under `/x402/releases/<ECR_REPOSITORY>/<tag>`. Grant `ssm:GetParameters` and create-only `ssm:PutParameter` on this path to the trusted release role. Enforce the `ssm:Overwrite` IAM condition, deny deletion to the release role and keep write access separate from general ECR publishing access. A rerun or rollback checks the existing version tag against this record. For a legacy tag without a record, choose a new version tag and build it through the release workflow. Keep staged `candidate-*` images until their versions are published so a rerun can finish an interrupted publication.
 
 Production deployments run one at a time. The Deployment annotation `x402.incentiv.io/highest-release` records the highest version requested, even if its rollout fails. Keep that annotation when applying infrastructure changes. If production already uses version tags before adopting this workflow, seed it with the current release tag before the first run. To roll back, select an earlier tag with an existing ECR image and set `rollback` to `true`. Rollback leaves the highest requested version in place, so pending runs for older versions cannot undo it accidentally.
+
+Release and rollback commits must include `c81d10f`, the release baseline with durable submission recovery and the publication fixes. Check rollback compatibility using a staging copy of the current data before rolling back. When changing the persisted format, verify that supported rollback versions can read and preserve the new data. If they cannot, plan a migration that keeps settlement records intact and update the workflow's release baseline before enabling the new format in production.
 
 ## Endpoints
 

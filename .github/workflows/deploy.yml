@@ -48,6 +48,12 @@ jobs:
             echo "::error::Tag $TAG must point to a commit on main"
             exit 1
           fi
+          # This baseline includes the release blockers and the current settlement store format.
+          baseline=c81d10fe5d3c0c67739bef4154384ef577e73141
+          if ! git merge-base --is-ancestor "$baseline" "$COMMIT"; then
+            echo "::error::Tag $TAG predates the supported facilitator release baseline"
+            exit 1
+          fi
           printf 'tag=%s\ncommit=%s\n' "$TAG" "$COMMIT" >> "$GITHUB_OUTPUT"
 
   test:
