@@ -11,7 +11,8 @@ export const SITE_DIR = fileURLToPath(new URL("../../site", import.meta.url));
  * paths (`/supported`, `/verify`, `/settle`, `/health`, `/discovery/*`) are never shadowed, and a library user of
  * `createFacilitatorApp` gets no site unless they add it.
  *
- * The pages need no script, so the content security policy allows none.
+ * The pages need no script, so the content security policy allows none. The only outside origin is Fontshare,
+ * for the Clash Grotesk typeface that incentiv.io uses; without it the pages fall back to the system font.
  */
 export function siteRouter(dir: string = SITE_DIR): Router | undefined {
   if (!existsSync(dir)) return undefined;
@@ -25,7 +26,7 @@ export function siteRouter(dir: string = SITE_DIR): Router | undefined {
       setHeaders: (res) => {
         res.setHeader(
           "content-security-policy",
-          "default-src 'none'; style-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+          "default-src 'none'; style-src 'self' https://api.fontshare.com; font-src https://cdn.fontshare.com; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         );
         res.setHeader("x-content-type-options", "nosniff");
         res.setHeader("referrer-policy", "no-referrer");
