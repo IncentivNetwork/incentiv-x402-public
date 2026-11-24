@@ -70,6 +70,7 @@ jobs:
       id-token: write # OIDC token for the deployment role; this job only
     env:
       TAG: ${{ needs.release.outputs.tag }}
+      COMMIT: ${{ needs.release.outputs.commit }}
       ROLLBACK: ${{ inputs.rollback }}
       AWS_REGION: ${{ vars.AWS_REGION }}
       ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
@@ -81,7 +82,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
           ref: ${{ needs.release.outputs.commit }}
+          path: release-source
 
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
@@ -89,36 +95,9 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
           mask-aws-account-id: true
 
-      # Image tags cannot be overwritten: deploying a version again reuses its image.
-      - name: Build and push the image
+      - name: Publish or verify the release image
         id: image
-        run: |
-          set -euo pipefail
-          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-          REGISTRY="$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com"
-          digest() {
-            aws ecr batch-get-image --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$TAG" \
-              --query 'images[0].imageId.imageDigest' --output text
-          }
-          DIGEST=$(digest)
-          if [ -z "$DIGEST" ] || [ "$DIGEST" = None ]; then
-            if [[ "$ROLLBACK" == true ]]; then
-              echo "::error::No existing image for rollback to $TAG"
-              exit 1
-            fi
-            aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
-            docker build --pull -t "$REGISTRY/$ECR_REPOSITORY:$TAG" .
-            docker push "$REGISTRY/$ECR_REPOSITORY:$TAG"
-            docker logout "$REGISTRY"
-            DIGEST=$(digest)
-          else
-            echo "$TAG is already built, deploying the existing image"
-          fi
-          if ! [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::ECR did not return a valid image digest for $TAG"
-            exit 1
-          fi
-          echo "ref=$REGISTRY/$ECR_REPOSITORY@$DIGEST" >> "$GITHUB_OUTPUT"
+        run: bash .github/scripts/publish-facilitator.sh release-source
 
       - name: Roll out
         env:

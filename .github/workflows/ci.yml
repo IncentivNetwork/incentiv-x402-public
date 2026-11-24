@@ -39,3 +39,6 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      - name: Test release image verification
+        if: runner.os == 'Linux' && !inputs.commit
+        run: bash .github/scripts/test-publish-facilitator.sh
