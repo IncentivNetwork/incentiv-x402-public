@@ -1,6 +1,6 @@
 {
   "name": "@incentiv/x402",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "x402 payments on Incentiv: two payment schemes for the stock @x402 packages, and a facilitator service.",
   "keywords": [
     "x402",

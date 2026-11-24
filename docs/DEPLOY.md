@@ -64,7 +64,7 @@ All settings are environment variables. Defaults are Incentiv mainnet.
 
 Protect `main` with PR review and restrict the GitHub `prod` environment to the **branch** `main` only. Remove any tag policies from that environment. Configure the AWS role to require the repository's exact `prod` OIDC subject and the `sts.amazonaws.com` audience. Use the immutable subject with owner and repository IDs when enabled in the repository's OIDC settings. Limit the role to the configured ECR repository and EKS cluster, and limit its Kubernetes access to the facilitator Deployment. Enable immutable image tags on the ECR repository and protect Git release tags from updates and deletion.
 
-Set `AWS_ROLE_ARN`, `AWS_REGION`, `ECR_REPOSITORY`, `EKS_CLUSTER`, `K8S_NAMESPACE`, `K8S_DEPLOYMENT` and `K8S_CONTAINER` as variables in `prod`. Push a `vX.Y.Z` tag on a commit already on `main`. Run **Deploy facilitator** from `main` in GitHub Actions with that tag, or use `gh workflow run deploy.yml --ref main -f tag=vX.Y.Z`. The workflow tests the tagged commit using the current CI matrix before building or reusing the immutable image and deploying by digest. Tag creation by itself does not start a release.
+Set `AWS_ROLE_ARN`, `AWS_REGION`, `ECR_REPOSITORY`, `EKS_CLUSTER`, `K8S_NAMESPACE`, `K8S_DEPLOYMENT` and `K8S_CONTAINER` as variables in `prod`. Push a `vX.Y.Z` tag on a commit already on `main`. Run **Deploy facilitator** from `main` in GitHub Actions with that tag, or use `gh workflow run deploy.yml --ref main -f tag=vX.Y.Z`. The workflow tests the tagged commit using the current CI matrix before building or reusing the immutable image and deploying by digest. Tag creation by itself does not start a deployment. It publishes the npm package; see [Publish the npm package](#publish-the-npm-package).
 
 This workflow releases code already on `main`. For fixes under coordinated disclosure, deploy the verified build privately before publishing the source and retain the commit and image digest for verification at publication.
 
@@ -88,6 +88,14 @@ kubectl -n x402 get deployment facilitator \
 Dispatch **Deploy facilitator** from `main` with the target tag, `rollback` set to `true`, and the inspected value in `rollback_from`. The workflow checks that the Deployment UID and generation still match. If either differs, inspect the new release before dispatching another rollback.
 
 Release and rollback commits must include `c81d10f`, the release baseline with durable submission recovery and the publication fixes. Check rollback compatibility using a staging copy of the current data before rolling back. When changing the persisted format, verify that supported rollback versions can read and preserve the new data. If they cannot, plan a migration that keeps settlement records intact and update the workflow's release baseline before enabling the new format in production.
+
+## Publish the npm package
+
+Pushing a `vX.Y.Z` tag runs **Publish to npm**. The workflow requires the tag to point to a commit on `main` and to match the `package.json` version at that commit, tests that commit with the CI matrix and publishes `@incentiv/x402` with provenance through npm trusted publishing. No npm token is stored in GitHub. A prerelease tag such as `v0.2.0-rc.1` publishes under the `next` dist-tag; only a release moves `latest`. To publish an existing tag again after a failed run, dispatch the workflow from `main` with the tag, or use `gh workflow run publish.yml --ref main -f tag=vX.Y.Z`. A version that is already on npm is not published again.
+
+Bump the version in `package.json` through a pull request before tagging. The same tag can then be deployed with **Deploy facilitator**.
+
+Restrict the GitHub `npm` environment to the branch `main` and tags `v*`. In the package settings on npmjs.com, add a trusted publisher for the GitHub repository `IncentivNetwork/incentiv-x402-public`, workflow `publish.yml` and environment `npm`. Then require two-factor authentication and disallow tokens for publishing. Trusted publishers can only be added to a package that already exists, so the first version is published once by an owner of the `@incentiv` npm organization.
 
 ## Endpoints
 
