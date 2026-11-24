@@ -122,10 +122,8 @@ jobs:
             echo '::error::K8S_CONTAINER does not name a container in the Deployment'
             exit 1
           fi
-          if ! jq -e '
-            .readinessProbe.httpGet | .path == "/health" and (.scheme // "HTTP") == "HTTP" and (.host // "") == ""
-          ' <<< "$CONTAINER" >/dev/null; then
-            echo '::error::Configure an HTTP readiness probe to /health on the facilitator pod'
+          if ! jq -e -f .github/scripts/validate-facilitator-readiness.jq <<< "$CONTAINER" >/dev/null; then
+            echo '::error::Configure HTTP readiness on /health at the facilitator PORT with timeoutSeconds of at least 25. Use a literal PORT when supplying envFrom or overriding the default.'
             exit 1
           fi
           GRACE=$(jq '.spec.template.spec.terminationGracePeriodSeconds // 0' <<< "$LIVE")

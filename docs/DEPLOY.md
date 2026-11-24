@@ -57,7 +57,7 @@ All settings are environment variables. Defaults are Incentiv mainnet.
 - Configure the facilitator Deployment in your infrastructure with `replicas: 1` and `strategy.type: Recreate`. Use a persistent volume mounted at the facilitator's data directory and keep autoscaling disabled. A release waits for the old revision to terminate before starting the new one, so plan for a short interruption. During maintenance, avoid deleting a running pod directly: the ReplicaSet can start a replacement before termination finishes. Use a Deployment rollout or scale to zero and confirm the old process has stopped before scaling back up.
 - Use SIGTERM and set `terminationGracePeriodSeconds` to at least 75 in the pod template. If the facilitator has a `preStop` hook, use a Kubernetes `sleep` handler and add its full duration to that minimum. Apply these settings and confirm the running pod uses them before enabling the release workflow. Changing a template does not extend the grace period of an existing pod.
 - Before the first release and after changing infrastructure, verify that the running pod mounts the intended persistent storage read-write at `FACILITATOR_DATA_DIR` (`/data` by default). If using a persistent volume claim, verify the claim is bound and the running pod and Deployment template reference the same claim.
-- Configure the facilitator container's HTTP `readinessProbe` to GET `/health` on its listening port (`4020` by default). Use the pod IP and allow enough time for the RPC and bundler checks. The rollout waits for Kubernetes to report the new pod as available. Use the service endpoint checks below to verify traffic through the load balancer.
+- Configure the facilitator container's HTTP `readinessProbe` to GET `/health` on its listening port (`4020` by default). Use the pod IP and either the port number or a name declared for that TCP port on the facilitator container. If using `envFrom` or a custom listening port, set `PORT` explicitly as a literal in the container's `env`. Set `timeoutSeconds` to at least 25 to allow a single RPC attempt of up to 20 seconds plus HTTP overhead. Retries may take longer. The rollout waits for Kubernetes to report the new pod as available. Use the service endpoint checks below to verify traffic through the load balancer.
 - Set the `prod` environment variable `K8S_CONTAINER` to the facilitator container name. The release workflow checks the Deployment template's rollout, readiness and shutdown settings before updating that container.
 
 ### Release a version
@@ -94,6 +94,6 @@ With discovery on, a resource is cataloged when a payment for it settles success
 
 ## After deploying
 
-1. Open `https://<your-host>/health` and `https://<your-host>/supported`.
+1. Check `https://<your-host>/health` returns HTTP 200 with both `rpc` and `bundler` set to `ok`. Check `https://<your-host>/supported` lists the facilitator's schemes.
 2. Run `npm run e2e` against it with a funded test payer (point the merchant at the new facilitator URL).
 3. Give merchants the seller quickstart in the README.

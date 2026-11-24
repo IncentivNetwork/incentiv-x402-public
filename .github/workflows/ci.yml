@@ -39,6 +39,8 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
-      - name: Test release image verification
+      - name: Test deployment checks
         if: runner.os == 'Linux' && !inputs.commit
-        run: bash .github/scripts/test-publish-facilitator.sh
+        run: |
+          bash .github/scripts/test-publish-facilitator.sh
+          bash .github/scripts/test-facilitator-readiness.sh
