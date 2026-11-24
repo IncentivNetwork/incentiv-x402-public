@@ -1,19 +1,85 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { decodePaymentRequiredHeader, encodePaymentSignatureHeader } from "@x402/core/http";
+import { x402ResourceServer } from "@x402/core/server";
+import { paymentMiddleware } from "@x402/express";
 import { declareDiscoveryExtension } from "@x402/extensions/bazaar";
+import express from "express";
+import type { AddressInfo } from "node:net";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { RateLimit } from "../src/facilitator/app.js";
 import { Catalog } from "../src/facilitator/catalog.js";
-import { FileStore, MemoryStore } from "../src/facilitator/store.js";
-import { IncentivEoaTxFacilitatorScheme, IncentivUserOpFacilitatorScheme, MAINNET } from "../src/index.js";
+import { FileStore, MemoryStore, NONCE_USED_GRACE_MS, RESULT_TTL_MS, type SettledStore } from "../src/facilitator/store.js";
+import { EOA_SCHEME, IncentivEoaTxFacilitatorScheme, IncentivEoaTxScheme, IncentivUserOpFacilitatorScheme, IncentivUserOpScheme, MAINNET, NETWORK, SCHEME } from "../src/index.js";
 import { deadlineMarker } from "../src/eoa.js";
 import { opFromWire, transferCall } from "../src/userop.js";
 
 const usdc = MAINNET.usdc;
 const merchant = "0x832166144c59Ed3524878441fa67F91615d2133B";
+
+test("upfront settlement keeps pending payments out of Express handlers", async () => {
+  const handled: string[] = [];
+  let settled = false;
+  const resource = new x402ResourceServer({
+    getSupported: async () => ({
+      kinds: [EOA_SCHEME, SCHEME].map((scheme) => ({ x402Version: 2, scheme, network: NETWORK })),
+      extensions: [],
+      signers: {},
+    }),
+    verify: async () => ({ isValid: true }),
+    settle: async () => settled
+      ? { success: true, transaction: `0x${"11".repeat(32)}`, network: NETWORK }
+      : { success: false, errorReason: "settle_timeout", transaction: "", network: NETWORK },
+  });
+  resource.register(NETWORK, new IncentivEoaTxScheme());
+  resource.register(NETWORK, new IncentivUserOpScheme());
+
+  const app = express();
+  const accepts = (scheme: string) => ({
+    scheme, network: NETWORK, payTo: merchant, price: "$0.01", extra: { paymentFlow: "upfront" },
+  });
+  app.use(paymentMiddleware({
+    "GET /eoa": { accepts: accepts(EOA_SCHEME) },
+    "GET /userop": { accepts: accepts(SCHEME) },
+  }, resource));
+  app.get(["/eoa", "/userop"], (req, res) => {
+    handled.push(req.path);
+    res.json({ paid: true });
+  });
+  const listener = app.listen(0, "127.0.0.1");
+  try {
+    await new Promise<void>((resolve, reject) => {
+      listener.once("listening", resolve);
+      listener.once("error", reject);
+    });
+    const base = `http://127.0.0.1:${(listener.address() as AddressInfo).port}`;
+    for (const route of ["/eoa", "/userop"]) {
+      const url = base + route;
+      const prompt = await fetch(url);
+      assert.equal(prompt.status, 402);
+      const { accepts: [accepted] } = decodePaymentRequiredHeader(prompt.headers.get("payment-required")!);
+      assert.ok(accepted);
+      assert.equal(accepted.extra.paymentFlow, "upfront");
+      await prompt.text();
+      const headers = { "payment-signature": encodePaymentSignatureHeader({ x402Version: 2, accepted, payload: {} }) };
+      settled = false;
+      const pending = await fetch(url, { headers });
+      assert.equal(pending.status, 402);
+      await pending.text();
+      assert.ok(!handled.includes(route));
+      settled = true;
+      const paid = await fetch(url, { headers });
+      assert.equal(paid.status, 200);
+      assert.deepEqual(await paid.json(), { paid: true });
+      assert.equal(handled.filter((path) => path === route).length, 1);
+    }
+  } finally {
+    listener.close();
+  }
+});
 
 test("opFromWire rejects odd-length hex and quantities that do not fit the EntryPoint's packing", () => {
   const good = {
@@ -97,15 +163,108 @@ test("requirements without a numeric maxTimeoutSeconds are refused before any de
   }
 });
 
-test("claims older than an hour are forgotten, and the earlier list format still loads", () => {
+test("legacy claims migrate to the submission lifetime, and the earlier list format still loads", () => {
   const dir = mkdtempSync(join(tmpdir(), "x402-claims-"));
   const path = join(dir, "s.json");
-  writeFileSync(path, JSON.stringify({ settled: {}, claims: { "0xold": Date.now() - 2 * 3_600_000, "0xnew": Date.now() - 60_000 } }));
+  writeFileSync(path, JSON.stringify({ settled: {}, claims: {
+    "0xold": Date.now() - RESULT_TTL_MS - 60_000,
+    "0xlate": Date.now() - 2 * 3_600_000,
+    "0xnew": Date.now() - 60_000,
+  } }));
   const s = new FileStore(path);
   assert.equal(s.isClaimed("0xold"), false, "a stale claim is dropped on load");
+  assert.ok(s.isSubmitted("0xlate"), "the legacy claim can recover a late receipt");
   assert.ok(s.isClaimed("0xnew"));
   writeFileSync(path, JSON.stringify({ settled: {}, claims: ["0xlisted"] }));
   assert.ok(new FileStore(path).isClaimed("0xlisted"), "a claim from the list format counts as claimed now");
+});
+
+test("a resubmission keeps the original claim lifetime", () => {
+  const store = new MemoryStore();
+  const now = Date.now;
+  const submittedAt = now();
+  try {
+    Date.now = () => submittedAt;
+    store.claimForSubmission("0xaa");
+    Date.now = () => submittedAt + RESULT_TTL_MS - 1;
+    store.claimForSubmission("0xaa");
+    assert.ok(store.isClaimed("0xaa"));
+    Date.now = () => submittedAt + RESULT_TTL_MS;
+    assert.equal(store.isClaimed("0xaa"), false);
+  } finally {
+    Date.now = now;
+  }
+});
+
+test("a failed nonce reset starts fresh grace after reopening the file store", () => {
+  class FailingFileStore extends FileStore {
+    fail = false;
+    protected override save() {
+      if (this.fail) throw new Error("write failed");
+      super.save();
+    }
+  }
+  const dir = mkdtempSync(join(tmpdir(), "x402-observed-nonce-"));
+  try {
+    const path = join(dir, "s.json");
+    const hash = "0xaa";
+    const now = Date.now();
+    const store = new FailingFileStore(path);
+    store.claimForSubmission(hash);
+    store.nonceUsedPastGrace(hash, true, now - NONCE_USED_GRACE_MS);
+    store.fail = true;
+    assert.throws(() => store.nonceUsedPastGrace(hash, false, now), /write failed/);
+    const stored = JSON.parse(readFileSync(path, "utf8")) as { submitted: Record<string, number> };
+    assert.equal(stored.submitted[hash], now - NONCE_USED_GRACE_MS);
+
+    const reopened = new FileStore(path);
+    const nextObservation = now + 1;
+    assert.ok(reopened.isSubmitted(hash));
+    assert.equal(reopened.nonceUsedPastGrace(hash, true, nextObservation), false);
+    assert.equal(reopened.nonceUsedPastGrace(hash, true, nextObservation + NONCE_USED_GRACE_MS - 1), false);
+    assert.equal(reopened.nonceUsedPastGrace(hash, true, nextObservation + NONCE_USED_GRACE_MS), true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a failed nonce reset cannot restore an expired grace observation", () => {
+  class FailingStore extends MemoryStore {
+    fail = false;
+    protected override save() {
+      if (this.fail) throw new Error("write failed");
+    }
+  }
+  const store = new FailingStore();
+  const hash = "0xaa";
+  const now = Date.now();
+  store.claimForSubmission(hash);
+  store.nonceUsedPastGrace(hash, true, now - NONCE_USED_GRACE_MS);
+  store.fail = true;
+  assert.throws(() => store.nonceUsedPastGrace(hash, false, now), /write failed/);
+  assert.throws(() => store.nonceUsedPastGrace(hash, true, now + 1), /write failed/);
+  store.fail = false;
+  assert.equal(store.nonceUsedPastGrace(hash, true, now + 1), false);
+  assert.equal(store.nonceUsedPastGrace(hash, true, now + NONCE_USED_GRACE_MS), false);
+  assert.equal(store.nonceUsedPastGrace(hash, true, now + 1 + NONCE_USED_GRACE_MS), true);
+});
+
+test("custom stores declare their submission recovery capabilities", () => {
+  const store = new MemoryStore();
+  const legacy = {
+    get: store.get.bind(store), set: store.set.bind(store), claim: store.claim.bind(store),
+    isClaimed: store.isClaimed.bind(store), release: store.release.bind(store),
+  };
+  assert.throws(() => new IncentivEoaTxFacilitatorScheme({ store: legacy as SettledStore }), /submission claims/);
+  assert.throws(() => new IncentivUserOpFacilitatorScheme({ store: legacy as SettledStore }), /submission claims/);
+  const custom: SettledStore = {
+    ...legacy,
+    claimForSubmission: store.claimForSubmission.bind(store),
+    isSubmitted: store.isSubmitted.bind(store),
+    nonceUsedPastGrace: store.nonceUsedPastGrace.bind(store),
+  };
+  assert.doesNotThrow(() => new IncentivEoaTxFacilitatorScheme({ store: custom }));
+  assert.doesNotThrow(() => new IncentivUserOpFacilitatorScheme({ store: custom }));
 });
 
 test("a catalog file saved before the key held network and payTo loses those entries and keeps the rest", () => {

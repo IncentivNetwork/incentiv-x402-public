@@ -3,7 +3,7 @@ export { IncentivUserOpScheme, toAtomic } from "./scheme/server.js";
 export { DEFAULT_MAX_GAS_FEE, DEFAULT_MAX_NATIVE_GAS_COST, IncentivUserOpClientScheme, type IncentivPayer, type UserOpPaymentPayload } from "./scheme/client.js";
 export { IncentivUserOpFacilitatorScheme, type FacilitatorOptions } from "./scheme/facilitator.js";
 export { createFacilitatorApp } from "./facilitator/app.js";
-export { FileStore, MemoryStore, type SettledStore } from "./facilitator/store.js";
+export { FileStore, MemoryStore, NONCE_USED_GRACE_MS, RESULT_TTL_MS, type SettledStore } from "./facilitator/store.js";
 export { decodePaymentOp, checkPaysRequirements, PaymentError } from "./decode.js";
 export { makeChain, preparePayment, paymentNonceKey, computeUserOpHash, type Chain, type UserOp } from "./userop.js";
 export { IncentivEoaTxScheme } from "./scheme/server-eoa.js";

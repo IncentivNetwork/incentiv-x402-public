@@ -3,7 +3,7 @@ import type { Network, PaymentPayload, PaymentRequirements, SchemeNetworkFacilit
 import { accountAbi, accountFactoryAbi, entryPointAbi, erc20Abi, TRANSFER_GATE_REASONS, transferGateAbi } from "../abi.js";
 import { MAINNET, MAX_TIMEOUT_SECONDS, NETWORK, SCHEME, ZERO32, type IncentivConfig } from "../constants.js";
 import { checkPaysRequirements, checkUsdcPositive, decodePaymentOp, logMessage, logToStderr, PaymentError, publicMessage, type DecodedPayment } from "../decode.js";
-import { MemoryStore, type SettledStore } from "../facilitator/store.js";
+import { settlementStore, type SettledStore } from "../facilitator/store.js";
 import {
   bundlerRpc,
   BundlerRpcError,
@@ -23,12 +23,16 @@ import {
   type OpReceipt,
   type UserOp,
 } from "../userop.js";
+import { nonceUsedPastGrace, recordNonceUsed } from "../facilitator/claim-recovery.js";
+import { OperationHistory } from "../facilitator/operation-history.js";
 import type { UserOpPaymentPayload } from "./client.js";
 import { TRANSFER_MISSING, userOperationOutcome } from "../facilitator/settlement.js";
 
 const MAX_BUNDLE_CANDIDATES = 4;
 const MAGIC_VALUE = "0x1626ba7e";
 const CLOCK_SKEW_SECONDS = 5;
+// Include blocks before the first possible submission to allow for clock differences.
+const HISTORY_TIMESTAMP_MARGIN_SECONDS = 300;
 
 export interface FacilitatorOptions {
   config?: IncentivConfig;
@@ -41,7 +45,7 @@ export interface FacilitatorOptions {
   log?: (line: Record<string, unknown>) => void;
 }
 
-type Parsed = Checked & { validUntil: number; maxTimeoutSeconds: number };
+type Parsed = Checked & { validUntil: number; maxTimeoutSeconds: number; settleDeadline?: number };
 
 interface Checked {
   op: UserOp;
@@ -62,15 +66,17 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
   private readonly now: () => number;
   private readonly log: (line: Record<string, unknown>) => void;
   private readonly inflight = new Map<string, Promise<SettleResponse>>();
+  private readonly operationHistory: OperationHistory;
 
   constructor(options: FacilitatorOptions = {}) {
     this.cfg = options.config ?? MAINNET;
-    this.chain = makeChain(this.cfg);
-    this.store = options.store ?? new MemoryStore();
+    this.chain = makeChain(this.cfg, { batchReads: true });
+    this.store = settlementStore(options.store);
     this.settleTimeoutMs = options.settleTimeoutMs ?? 60_000;
     this.pollIntervalMs = options.pollIntervalMs ?? 1_000;
     this.now = options.now ?? (() => Date.now());
     this.log = options.log ?? logToStderr;
+    this.operationHistory = new OperationHistory(this.store, this.log);
   }
 
   getExtra(_network: Network) {
@@ -191,7 +197,7 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
   }
 
   /** Checks against the chain: replay, signature, funds, TransferGate and simulation. */
-  private async checkChain({ op, userOpHash, decoded, payer }: Parsed, opts: { rejectSettled: boolean }): Promise<Checked> {
+  private async checkChain({ op, userOpHash, decoded, payer, settleDeadline }: Parsed, opts: { rejectSettled: boolean }): Promise<Checked> {
     if (opts.rejectSettled && this.store.get(userOpHash)) throw new PaymentError("already_settled", "this operation was already settled");
     const current = await this.chain.client.readContract({
       address: this.cfg.entryPoint,
@@ -199,6 +205,9 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
       functionName: "getNonce",
       args: [op.sender, op.nonce >> 64n],
     });
+    if (current <= op.nonce && settleDeadline !== undefined && this.now() < settleDeadline) {
+      nonceUsedPastGrace(this.store, userOpHash, this.now, false, this.log);
+    }
     if (current !== op.nonce) throw new PaymentError("nonce_used", `account nonce is ${current}, operation uses ${op.nonce}`);
 
     // 7. Signature: the owner's, checked the way the account will check it.
@@ -304,7 +313,6 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
     return publicMessage(reason, 1_000);
   }
 
-  /** A claim that cannot be released only lingers until CLAIM_TTL_MS; that is never worth failing a request. */
   private releaseClaim(hash: string) {
     try {
       this.store.release(hash);
@@ -351,6 +359,7 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
     if (!this.store.isClaimed(c.userOpHash)) return false;
     if (reason === "nonce_used") return true;
     if (reason !== "payment_expired") return false;
+    if (this.store.isSubmitted(c.userOpHash)) return true;
     const absent =
       (await this.within(deadline, () => this.opKnown(c.userOpHash))) === false && (await this.within(deadline, () => this.nonceUsed(c.op))) === false;
     return !absent;
@@ -359,7 +368,7 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
   /** Whether the operation's nonce has been used on chain; undefined if the RPC cannot say. */
   private async nonceUsed(op: UserOp): Promise<boolean | undefined> {
     try {
-      const current = await this.chain.client.readContract({ address: this.cfg.entryPoint, abi: entryPointAbi, functionName: "getNonce", args: [op.sender, op.nonce >> 64n] });
+      const current = await this.chain.client.readContract({ address: this.cfg.entryPoint, abi: entryPointAbi, functionName: "getNonce", args: [op.sender, op.nonce >> 64n], blockTag: "latest" });
       return current > op.nonce;
     } catch {
       return undefined;
@@ -387,7 +396,7 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
     const deadline = this.now() + this.settleTimeoutMs;
     let c: Parsed;
     try {
-      c = this.parse(payload, req);
+      c = { ...this.parse(payload, req), settleDeadline: deadline };
     } catch (e) {
       const v = this.invalid(e, "unexpected_settle_error");
       return this.fail(v.invalidReason ?? "unexpected_settle_error", v.invalidMessage ?? "", undefined);
@@ -493,7 +502,39 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
     // The answer when no receipt shows up in time. While this facilitator holds the claim, a retry can still find
     // the receipt, so that answer is always settle_timeout.
     const noReceipt = this.fail("settle_timeout", "no receipt within the settle window; resend the same payload", c.payer);
-    if (!receipt) {
+    let confirmedNonceUsed: boolean | undefined;
+    if (!receipt && this.store.isSubmitted(c.userOpHash)) {
+      confirmedNonceUsed = await this.within(deadline, () => this.nonceUsed(c.op));
+      const pastGrace = nonceUsedPastGrace(this.store, c.userOpHash, this.now, confirmedNonceUsed, this.log);
+      if (confirmedNonceUsed) {
+        const earliest = c.validUntil - MAX_TIMEOUT_SECONDS - CLOCK_SKEW_SECONDS - HISTORY_TIMESTAMP_MARGIN_SECONDS;
+        const historical = await this.within(deadline, () => this.operationHistory.find(
+          this.chain, c.userOpHash, c.payer, c.op.nonce, earliest, () => this.now() < deadline,
+        ));
+        if (historical === "nonce_unused") {
+          nonceUsedPastGrace(this.store, c.userOpHash, this.now, false, this.log);
+        } else if (historical && "absentAt" in historical) {
+          if (pastGrace) {
+            const stillAbsent = await this.within(deadline, lookUp);
+            if (stillAbsent === null) {
+              const { absentAt } = historical;
+              const canonical = await this.within(deadline, () => this.chain.client.getBlock({ blockNumber: absentAt.number }));
+              if (!canonical) return noReceipt;
+              if (canonical.hash !== absentAt.hash) {
+                nonceUsedPastGrace(this.store, c.userOpHash, this.now, false, this.log);
+                return noReceipt;
+              }
+              const used = this.fail("nonce_used", "the confirmed nonce advanced and the payment receipt did not appear", c.payer);
+              return recordNonceUsed(this.store, c.userOpHash, used, noReceipt, this.log);
+            }
+            receipt = stillAbsent;
+          }
+        } else if (historical) {
+          receipt = historical;
+        }
+      }
+    }
+    if (!receipt && !confirmedNonceUsed) {
       let submit = true;
       try {
         submit = !hasBundlerReceipt;
@@ -516,7 +557,7 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
         // Whether an earlier settle submitted it and lost the answer: a copy of it may then still be queued.
         const claimedBefore = this.store.isClaimed(c.userOpHash);
         try {
-          this.store.claim(c.userOpHash);
+          this.store.claimForSubmission(c.userOpHash);
         } catch (e) {
           this.log({ event: "store_error", hash: c.userOpHash, error: logMessage(e) });
           return this.fail("store_unavailable", "the facilitator cannot record payments right now; nothing was submitted", c.payer);
@@ -532,13 +573,10 @@ export class IncentivUserOpFacilitatorScheme implements SchemeNetworkFacilitator
             // refuse a resend because the first copy landed, or because it is still queued (getNonce does not see
             // the queue, and not every bundler words a duplicate in a way the check above recognizes).
             receipt = await this.within(deadline, lookUp);
-            // Held by the bundler: the claim is kept. Absent: the nonce decides. Unknown (the lookup failed, or the
-            // bundler lacks the method): the claim is kept if an earlier settle submitted a copy that may be queued;
-            // on a first submission there is no earlier copy, so the nonce decides.
-            const held = receipt ? true : await this.within(deadline, () => this.opKnown(c.userOpHash));
-            const used =
-              held === true ? true : held === false || !claimedBefore ? await this.within(deadline, () => this.nonceUsed(c.op)) : undefined;
-            if (used === false) {
+            // A pending operation may be invisible to both the bundler lookup and the confirmed nonce.
+            if (!receipt && !claimedBefore &&
+                (await this.within(deadline, () => this.opKnown(c.userOpHash))) !== true &&
+                (await this.within(deadline, () => this.nonceUsed(c.op))) === false) {
               this.releaseClaim(c.userOpHash);
               this.log({ event: "payment_error", reason: "userop_rejected", error: logMessage(e) });
               return this.fail("userop_rejected", publicMessage(e, 1_000), c.payer);

@@ -20,7 +20,7 @@ export function toAtomic(value: string | number, decimals: number): string {
 export class IncentivUserOpScheme implements SchemeNetworkServer {
   readonly scheme: string = SCHEME;
   readonly defaultAssetTransferMethod = "default";
-  readonly paymentFlows = { default: { supported: ["authorization"], default: "authorization" } } as const;
+  readonly paymentFlows = { default: { supported: ["authorization", "upfront"], default: "authorization" } } as const;
 
   constructor(private readonly cfg: IncentivConfig = MAINNET) {}
 

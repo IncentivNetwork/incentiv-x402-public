@@ -4,6 +4,7 @@ import {
   createPublicClient,
   encodeAbiParameters,
   encodeFunctionData,
+  fallback,
   http,
   HttpRequestError,
   keccak256,
@@ -28,11 +29,13 @@ export interface Chain {
 }
 
 /** viem sends `eth_sendRawTransaction` once (`retryCount: 0`); its reads are retried as configured here. */
-export function makeChain(config: IncentivConfig = MAINNET): Chain {
-  const client = createPublicClient({
-    transport: http(config.rpcUrl, { timeout: 20_000, fetchOptions: { headers: { "User-Agent": USER_AGENT } } }),
-  });
-  return { config, client };
+export function makeChain(config: IncentivConfig = MAINNET, options: { batchReads?: boolean } = {}): Chain {
+  const transportOptions = { timeout: 20_000, fetchOptions: { headers: { "User-Agent": USER_AGENT } } };
+  const single = http(config.rpcUrl, transportOptions);
+  const transport = options.batchReads
+    ? fallback([http(config.rpcUrl, { ...transportOptions, batch: { batchSize: 64 } }), single])
+    : single;
+  return { config, client: createPublicClient({ transport }) };
 }
 
 /**
@@ -329,8 +332,9 @@ export interface OpReceipt {
   reason?: string;
 }
 
-export async function getOpReceipt(chain: Chain, userOpHash: Hex): Promise<OpReceipt | undefined> {
+export async function getOpReceipt(chain: Chain, userOpHash: Hex): Promise<OpReceipt | null | undefined> {
   const r = (await bundlerRpc(chain, "eth_getUserOperationReceipt", [userOpHash])) as Record<string, unknown> | null;
+  if (r === null) return null;
   if (!r) return undefined;
   const receipt = (r.receipt ?? {}) as Record<string, unknown>;
   const rawTransactionHash = receipt.transactionHash ?? r.transactionHash;

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { bazaarResourceServerExtension, declareDiscoveryExtension } from "@x402/extensions/bazaar";
 import { Catalog } from "../src/facilitator/catalog.js";
+import { MAINNET, SCHEME } from "../src/constants.js";
 
 const req = { scheme: "incentiv-eoa-tx", network: "eip155:24101" as const, asset: "0x16e43840d8D79896A389a3De85aB0B0210C05685", amount: "10000", payTo: "0x832166144c59Ed3524878441fa67F91615d2133B", maxTimeoutSeconds: 120, extra: {} };
 // The resource server's Bazaar extension adds the HTTP method when it enriches the declaration; do the same here.
@@ -24,6 +25,24 @@ test("a settled payment that declared discovery info is cataloged and listed", (
   assert.equal(list.items[0]!.resource, "https://api.example.com/weather");
   assert.equal(list.items[0]!.accepts[0]!.payTo, req.payTo);
   assert.equal(list.items[0]!.serviceName, "Weather");
+});
+
+test("a listing preserves the upfront flow for both schemes", () => {
+  const catalog = new Catalog();
+  const eoa = { ...req, extra: { paymentFlow: "upfront", unrelated: true } };
+  const userOp = { ...eoa, scheme: SCHEME, extra: { ...eoa.extra, entryPoint: MAINNET.entryPoint } };
+  for (const requirements of [eoa, userOp]) {
+    assert.equal(catalog.record(payload({ accepted: requirements }) as never, requirements).status, "success");
+  }
+  const listing = catalog.list({}).items[0]!;
+  assert.equal(catalog.list({}).pagination.total, 1);
+  assert.deepEqual(
+    Object.fromEntries(listing.accepts.map(({ scheme, extra }) => [scheme, extra])),
+    {
+      [eoa.scheme]: { paymentFlow: "upfront" },
+      [userOp.scheme]: { paymentFlow: "upfront", entryPoint: MAINNET.entryPoint },
+    },
+  );
 });
 
 test("without discovery info nothing is cataloged", () => {

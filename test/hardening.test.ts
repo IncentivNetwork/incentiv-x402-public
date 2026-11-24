@@ -5,12 +5,13 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
+import * as viem from "viem";
 import { declareDiscoveryExtension } from "@x402/extensions/bazaar";
 import { spawn } from "node:child_process";
 import express from "express";
 import { createFacilitatorApp, rateKey } from "../src/facilitator/app.js";
 import { Catalog, CATALOG_LIMITS, QueryTooLongError } from "../src/facilitator/catalog.js";
-import { CLAIM_TTL_MS, FileStore, MemoryStore, RESULT_TTL_MS } from "../src/facilitator/store.js";
+import { CLAIM_TTL_MS, FileStore, MemoryStore, NONCE_USED_GRACE_MS, RESULT_TTL_MS } from "../src/facilitator/store.js";
 import { checkPaysRequirements, logMessage, PaymentError, publicMessage } from "../src/decode.js";
 import { IncentivEoaTxFacilitatorScheme, IncentivUserOpFacilitatorScheme, MAINNET } from "../src/index.js";
 import { BundlerRpcError, bundlerRpc, nonceRefusal } from "../src/userop.js";
@@ -710,7 +711,7 @@ class FlakyStore extends MemoryStore {
 }
 
 /** A stand-in bundler that answers eth_getUserOperationReceipt with `receipt`. */
-async function fakeBundler(receipt: unknown) {
+async function fakeBundler(receipt: unknown, fail?: (method: string) => boolean) {
   const methods: string[] = [];
   const server = createServer((r, res) => {
     let body = "";
@@ -718,6 +719,7 @@ async function fakeBundler(receipt: unknown) {
     r.on("end", () => {
       const { id, method } = JSON.parse(body) as { id: number; method: string };
       methods.push(method);
+      if (fail?.(method)) return void res.writeHead(503).end("receipt RPC unavailable");
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ jsonrpc: "2.0", id, result: typeof receipt === "function" ? receipt(method) : receipt }));
     });
@@ -2313,29 +2315,21 @@ test("user operations: a resend refused while the first copy is queued at the bu
     // A resend after an earlier settle lost its answer (the claim is already held), and the bundler cannot say
     // whether it holds the first copy: the lookup fails, the method is missing, or the answer has no result. The
     // first copy may still be queued, so the claim is kept.
-    for (const q of ["error", "unsupported", "noResult"] as const) {
+    for (const q of [false, "error", "unsupported", "noResult"] as const) {
       queued = q;
       const earlier = new MemoryStore();
-      earlier.claim(opHash);
+      earlier.claimForSubmission(opHash);
       const u = userOpScheme(earlier, url);
       Object.assign(u, { settleTimeoutMs: 50, pollIntervalMs: 5 });
-      assert.equal((await u.settle(opPayload as never, req() as never)).errorReason, "settle_timeout", q);
+      assert.equal((await u.settle(opPayload as never, req() as never)).errorReason, "settle_timeout", String(q));
       assert.ok(earlier.isClaimed(opHash), `${q}: the earlier claim is kept`);
     }
     // A first submission has no earlier copy: with the lookup unknown, the unused nonce decides.
-    for (const q of ["error", "unsupported", "noResult"] as const) {
+    for (const q of [false, "error", "unsupported", "noResult"] as const) {
       queued = q;
       const fresh = new MemoryStore();
-      assert.equal((await userOpScheme(fresh, url).settle(opPayload as never, req() as never)).errorReason, "userop_rejected", q);
+      assert.equal((await userOpScheme(fresh, url).settle(opPayload as never, req() as never)).errorReason, "userop_rejected", String(q));
       assert.ok(!fresh.isClaimed(opHash));
-    }
-    // The bundler explicitly holds nothing and the nonce is unused: the refusal is final, resend or not.
-    queued = false;
-    for (const earlierClaim of [false, true]) {
-      const other = new MemoryStore();
-      if (earlierClaim) other.claim(opHash);
-      assert.equal((await userOpScheme(other, url).settle(opPayload as never, req() as never)).errorReason, "userop_rejected", `earlier claim: ${earlierClaim}`);
-      assert.ok(!other.isClaimed(opHash));
     }
   } finally {
     server.close();
@@ -2860,4 +2854,318 @@ test("nonce refusals are recognized in the usual node wordings", () => {
     assert.ok(nonceRefusal(m), m);
   }
   for (const m of ["insufficient funds for gas * price + value", "intrinsic gas too low", "invalid sender"]) assert.ok(!nonceRefusal(m), m);
+});
+
+test("both schemes recover a two-hour-old submission once and end a replaced nonce after the grace period", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "x402-submission-recovery-"));
+  const realNow = Date.now;
+  const txHash = `0x${"11".repeat(32)}` as const;
+  const to = "0x0000000000000000000000000000000000000001";
+  const paid = {
+    status: "success",
+    logs: [{
+      address: MAINNET.usdc,
+      topics: viem.encodeEventTopics({ abi: viem.erc20Abi, eventName: "Transfer", args: { from: merchant, to } }),
+      data: viem.encodeAbiParameters([{ type: "uint256" }], [1n]),
+    }],
+  };
+  let visible = false;
+  let confirmed = false;
+  let expired = false;
+  let finalLookup: "found" | "error" | "reorg" | undefined;
+  let receiptLookups = 0;
+  let snapshotNonceUnused = false;
+  let historyAvailable = true;
+  let sends = 0;
+  class RecoveryStore extends FileStore {
+    rejectNonceResult = false;
+    protected override save() {
+      if (this.rejectNonceResult &&
+          (this.get(txHash)?.errorReason === "nonce_used" || this.get(opHash)?.errorReason === "nonce_used")) {
+        throw new Error("final result write failed");
+      }
+      super.save();
+    }
+  }
+  const bundler = await fakeBundler(
+    (method: string) => method === "eth_sendUserOperation" ? opHash
+      : visible || (finalLookup === "found" && receiptLookups === 2) ? { success: true, receipt: { transactionHash: txHash } } : null,
+    (method) => method === "eth_getUserOperationReceipt" && finalLookup !== undefined && ++receiptLookups === 2 && finalLookup === "error",
+  );
+  try {
+    for (const scheme of ["eoa", "user-op"]) {
+      const cases = ["landed", "replaced", "final lookup", "final error", "reorg", "snapshot reset"];
+      if (scheme === "user-op") cases.push("historical");
+      for (const outcome of cases) {
+        const path = join(dir, `${scheme}-${outcome}.json`);
+        const settle = (store: FileStore) => {
+          let attemptTime = Date.now();
+          const timings = { now: () => attemptTime, settleTimeoutMs: 5_000, pollIntervalMs: 10 };
+          const pause = async (deadline: number) => { attemptTime = deadline; };
+          const checkDeadline = () => {
+            if (expired) throw new PaymentError("payment_expired", "validUntil has passed");
+          };
+          if (scheme === "user-op") {
+            const s = userOpScheme(store, bundler.url);
+            const scheme = s as unknown as { parse(): { validUntil: number }; chain: { client: object } };
+            const parsed = { ...scheme.parse(), validUntil: Math.floor(realNow() / 1000) + 60 };
+            Object.assign(s, { ...timings, pause, checkDeadline, parse: () => parsed, nonceUsed: async () => confirmed });
+            Object.assign(scheme.chain.client, {
+              getBlock: async ({ blockNumber }: { blockNumber?: bigint }) => ({
+                number: blockNumber ?? 1n,
+                hash: finalLookup === "reorg" && receiptLookups >= 2 ? `0x${"12".repeat(32)}` : txHash,
+                parentHash: txHash,
+                timestamp: BigInt(Math.floor(realNow() / 1000) + (blockNumber === 0n ? -3600 : 7200)),
+              }),
+              readContract: async () => snapshotNonceUnused ? 0n : 1n,
+              getLogs: async ({ blockHash, args }: { blockHash?: string; args: { userOpHash: string } }) => {
+                if (!historyAvailable) throw new Error("archive RPC unavailable");
+                if (blockHash) assert.equal(blockHash, txHash);
+                assert.equal(args.userOpHash, opHash);
+                return outcome === "historical" ? [{
+                  transactionHash: txHash, blockNumber: 1n, blockHash: txHash, removed: false,
+                  args: { userOpHash: opHash, sender: merchant, nonce: 0n, success: true },
+                }] : [];
+              },
+            });
+            return () => s.settle(opPayload as never, req());
+          }
+          const s = new IncentivEoaTxFacilitatorScheme({ ...timings, store, log: () => {} });
+          Object.assign(s, {
+            parse: async () => ({ txHash, sender: merchant, token: MAINNET.usdc, to, amount: 1n, nonce: 0 }),
+            pause,
+            checkDeadline,
+            checkChain: async () => {},
+            chain: { client: {
+              getBlock: async ({ blockNumber }: { blockNumber?: bigint }) => ({
+                number: 1n,
+                hash: finalLookup === "reorg" && blockNumber === 1n ? `0x${"12".repeat(32)}` : txHash,
+              }),
+              getTransactionReceipt: async () => {
+                const recheck = finalLookup !== undefined && ++receiptLookups === 2;
+                if (recheck && finalLookup === "error") throw new Error("receipt RPC unavailable");
+                if (!visible && !(recheck && finalLookup === "found")) {
+                  throw new viem.TransactionReceiptNotFoundError({ hash: txHash });
+                }
+                return paid;
+              },
+              getTransactionCount: async ({ blockTag, blockHash, requireCanonical }: { blockTag?: string; blockHash?: string; requireCanonical?: boolean }) => {
+                if (blockTag === "pending") return 0;
+                if (blockHash) {
+                  assert.equal(blockHash, txHash);
+                  assert.equal(requireCanonical, true);
+                  return snapshotNonceUnused ? 0 : 1;
+                }
+                assert.equal(blockTag, "latest");
+                return confirmed ? 1 : 0;
+              },
+              sendRawTransaction: async () => { sends++; },
+            } },
+          });
+          return () => s.settle({} as never, req());
+        };
+        const start = realNow();
+        Date.now = () => start;
+        visible = confirmed = expired = false;
+        finalLookup = undefined;
+        snapshotNonceUnused = false;
+        historyAvailable = true;
+        receiptLookups = 0;
+        const sentBefore = sends + bundler.methods.filter((m) => m === "eth_sendUserOperation").length;
+        assert.equal((await settle(new FileStore(path))()).errorReason, "settle_timeout", scheme);
+        const hash = scheme === "eoa" ? txHash : opHash;
+        assert.ok(new FileStore(path).isSubmitted(hash), scheme);
+
+        const late = start + 2 * CLAIM_TTL_MS;
+        Date.now = () => late;
+        const recoveredStore = new RecoveryStore(path);
+        expired = true;
+        if (outcome === "replaced") {
+          assert.equal((await settle(recoveredStore)()).errorReason, "settle_timeout", "expired submission with an unused nonce stays retryable");
+        }
+        confirmed = true;
+        visible = outcome === "landed";
+        if (outcome === "landed" || outcome === "historical") {
+          const response = await settle(recoveredStore)();
+          assert.equal(response.success, true, JSON.stringify({ scheme, outcome, response }));
+          assert.equal((await settle(recoveredStore)()).errorReason, "already_settled", scheme);
+        } else {
+          if (scheme === "user-op" && outcome === "replaced") historyAvailable = false;
+          assert.equal((await settle(recoveredStore)()).errorReason, "settle_timeout", scheme);
+          Date.now = () => late + NONCE_USED_GRACE_MS;
+          if (scheme === "user-op" && outcome === "replaced") {
+            historyAvailable = false;
+            assert.equal((await settle(recoveredStore)()).errorReason, "settle_timeout");
+            assert.ok(new FileStore(path).isClaimed(hash), "an incomplete historical search cannot consume the claim");
+            historyAvailable = true;
+          }
+          if (outcome === "replaced") {
+            recoveredStore.rejectNonceResult = true;
+            assert.equal((await settle(recoveredStore)()).errorReason, "settle_timeout", scheme);
+            assert.equal(recoveredStore.get(hash), undefined, scheme);
+            assert.ok(new FileStore(path).isSubmitted(hash), scheme);
+            recoveredStore.rejectNonceResult = false;
+          }
+          if (outcome === "reorg" || outcome === "snapshot reset") {
+            if (outcome === "reorg") finalLookup = "reorg";
+            else snapshotNonceUnused = true;
+            assert.equal((await settle(recoveredStore)()).errorReason, "settle_timeout");
+            assert.ok(new FileStore(path).isClaimed(hash));
+            finalLookup = undefined;
+            snapshotNonceUnused = false;
+            assert.equal((await settle(recoveredStore)()).errorReason, "settle_timeout", "grace restarts");
+            Date.now = () => late + 2 * NONCE_USED_GRACE_MS;
+          }
+          if (outcome === "final lookup") finalLookup = "found";
+          if (outcome === "final error") finalLookup = "error";
+          const final = await settle(recoveredStore)();
+          if (finalLookup === "found") {
+            assert.equal(receiptLookups, 2);
+            assert.equal(final.success, true, "a receipt found on the final recheck is reported");
+          } else if (finalLookup === "error") {
+            assert.equal(final.errorReason, "settle_timeout");
+            assert.ok(new FileStore(path).isClaimed(hash));
+            assert.equal(new FileStore(path).get(hash), undefined);
+            finalLookup = undefined;
+            visible = true;
+            assert.equal((await settle(recoveredStore)()).success, true);
+          } else {
+            assert.equal(final.errorReason, "nonce_used", scheme);
+          }
+          assert.equal(new FileStore(path).isClaimed(hash), false, scheme);
+        }
+        assert.equal(sends + bundler.methods.filter((m) => m === "eth_sendUserOperation").length, sentBefore + 1, scheme);
+      }
+    }
+  } finally {
+    Date.now = realNow;
+    bundler.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a settlement nonce check restarts grace after the first user-operation nonce read fails", async () => {
+  const bundler = await fakeBundler(null);
+  try {
+    const store = new MemoryStore();
+    const now = Date.now();
+    store.claimForSubmission(opHash);
+    store.nonceUsedPastGrace(opHash, true, now - NONCE_USED_GRACE_MS - 1);
+    let nonceReads = 0;
+    let failFirstNonceRead = false;
+    const scheme = new IncentivUserOpFacilitatorScheme({ store, now: () => now, log: () => {} });
+    Object.assign(scheme, {
+      parse: () => ({
+        op: { sender: merchant, nonce: 0n }, userOpHash: opHash, decoded: { amount: 1n },
+        payer: merchant, validUntil: Math.floor(now / 1000) + 60, maxTimeoutSeconds: 120,
+      }),
+      chain: { config: { ...MAINNET, bundlerUrl: bundler.url }, client: {
+        readContract: async ({ functionName }: { functionName: string }) => {
+          assert.equal(functionName, "getNonce");
+          if (++nonceReads === 1 && failFirstNonceRead) throw new Error("first nonce read unavailable");
+          return 0n;
+        },
+        getCode: async () => "0x",
+      } },
+    });
+
+    const verification = await scheme.verify(opPayload as never, req());
+    assert.equal(verification.invalidReason, "invalid_signature");
+    assert.equal(store.nonceUsedPastGrace(opHash, true, now), true, "verify keeps the stored observation");
+
+    nonceReads = 0;
+    failFirstNonceRead = true;
+    const result = await scheme.settle(opPayload as never, req());
+    assert.equal(result.errorReason, "invalid_signature", "later checks can fail after the nonce was observed");
+    assert.equal(nonceReads, 2);
+    assert.equal(store.nonceUsedPastGrace(opHash, true, now), false, "the old timer was cleared");
+    assert.equal(store.nonceUsedPastGrace(opHash, true, now + NONCE_USED_GRACE_MS - 1), false);
+    assert.equal(store.nonceUsedPastGrace(opHash, true, now + NONCE_USED_GRACE_MS), true);
+  } finally {
+    bundler.close();
+  }
+});
+
+test("EOA retries clear an old grace observation when the receipt RPC fails and a nonce read shows unused", async () => {
+  const hash = `0x${"a1".repeat(32)}` as const;
+  for (const nonceReadDuringChecks of [false, true]) {
+    const store = new MemoryStore();
+    const s = new IncentivEoaTxFacilitatorScheme({ store, log: () => {}, settleTimeoutMs: 250, pollIntervalMs: 10 });
+    const now = Date.now();
+    store.claimForSubmission(hash);
+    store.nonceUsedPastGrace(hash, true, now - NONCE_USED_GRACE_MS - 1);
+    let reads = 0;
+    Object.assign(s, {
+      parse: async () => ({ txHash: hash, sender: merchant, nonce: 0, validUntil: Math.floor(now / 1000) + (nonceReadDuringChecks ? 30 : -1) }),
+      chain: { client: {
+        getTransactionReceipt: async () => { throw new Error("receipt RPC unavailable"); },
+        getTransactionCount: async () => {
+          if (++reads === 1 && nonceReadDuringChecks) throw new Error("first nonce read unavailable");
+          return 0;
+        },
+        readContract: async () => { throw new Error("stop after the settlement checks read the nonce"); },
+        getBalance: async () => 0n,
+      } },
+    });
+    const result = await s.settle({} as never, req());
+    assert.equal(result.errorReason, nonceReadDuringChecks ? "unexpected_settle_error" : "settle_timeout");
+    assert.equal(reads, nonceReadDuringChecks ? 2 : 1);
+    assert.equal(store.nonceUsedPastGrace(hash, true, now + 1_000), false, "a new advance starts a fresh grace period");
+  }
+});
+
+test("read-only EOA recovery polling lets another payment from the payer submit", async () => {
+  const oldHash = `0x${"a2".repeat(32)}` as const;
+  const newHash = `0x${"a3".repeat(32)}` as const;
+  const recipient = "0x0000000000000000000000000000000000000001";
+  const paid = {
+    status: "success",
+    logs: [{
+      address: MAINNET.usdc,
+      topics: viem.encodeEventTopics({ abi: viem.erc20Abi, eventName: "Transfer", args: { from: merchant, to: recipient } }),
+      data: viem.encodeAbiParameters([{ type: "uint256" }], [1n]),
+    }],
+  };
+  const store = new MemoryStore();
+  store.claimForSubmission(oldHash);
+  const s = new IncentivEoaTxFacilitatorScheme({ store, log: () => {}, settleTimeoutMs: 1_000, pollIntervalMs: 5 });
+  let polled!: () => void;
+  const pollStarted = new Promise<void>((resolve) => { polled = resolve; });
+  let resume!: () => void;
+  const paused = new Promise<void>((resolve) => { resume = resolve; });
+  let pauses = 0;
+  let submissions = 0;
+  let oldVisible = false;
+  Object.assign(s, {
+    parse: async ({ payload }: { payload: { txHash: string } }) => ({
+      txHash: payload.txHash, sender: merchant, nonce: 0, token: MAINNET.usdc, to: recipient, amount: 1n,
+      validUntil: Math.floor(Date.now() / 1000) + (payload.txHash === oldHash ? -1 : 30),
+    }),
+    checkChain: async () => {},
+    pause: async () => {
+      if (++pauses !== 1) return;
+      polled();
+      await paused;
+    },
+    chain: { client: {
+      getTransactionReceipt: async ({ hash }: { hash: viem.Hex }) => {
+        if (hash === oldHash ? oldVisible : submissions > 0) return paid;
+        throw new viem.TransactionReceiptNotFoundError({ hash });
+      },
+      getTransactionCount: async () => 0,
+      sendRawTransaction: async () => { submissions++; },
+    } },
+  });
+
+  const oldSettle = s.settle({ payload: { txHash: oldHash } } as never, req());
+  try {
+    await Promise.race([pollStarted, oldSettle.then(() => assert.fail("recovery never began polling"))]);
+    assert.equal((await s.settle({ payload: { txHash: newHash } } as never, req())).success, true);
+    assert.equal(submissions, 1);
+  } finally {
+    oldVisible = true;
+    resume();
+    await oldSettle;
+  }
+  assert.equal((await oldSettle).success, true);
 });

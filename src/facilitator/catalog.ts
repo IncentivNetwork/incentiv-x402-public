@@ -799,15 +799,19 @@ const MIME_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*(?: *;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 /**
- * The payment requirements fields a listing needs; anything else the request carried is not kept. `extra` keeps
- * only what a scheme defines (`incentiv-userop`'s EntryPoint, which settlement checked), since any sale at the
- * listed price replaces it.
+ * Keep the payment requirements needed by a listing. Preserve the checked UserOperation EntryPoint
+ * and the optional upfront flow alongside the standard fields.
  */
 function pickRequirements(r: PaymentRequirements): PaymentRequirements {
   const { scheme, network, asset, amount, payTo, maxTimeoutSeconds, extra } = r;
-  const entryPoint = (extra as { entryPoint?: unknown } | undefined)?.entryPoint;
-  const kept = scheme === SCHEME && typeof entryPoint === "string" && /^0x[0-9a-fA-F]{40}$/.test(entryPoint) ? { extra: { entryPoint } } : {};
-  return { scheme, network, asset, amount, payTo, maxTimeoutSeconds, ...kept } as PaymentRequirements;
+  const kept: Record<string, unknown> = {};
+  const entryPoint = extra?.entryPoint;
+  if (scheme === SCHEME && typeof entryPoint === "string" && /^0x[0-9a-fA-F]{40}$/.test(entryPoint)) {
+    kept.entryPoint = entryPoint;
+  }
+  if (extra?.paymentFlow === "upfront") kept.paymentFlow = "upfront";
+  const listed = { scheme, network, asset, amount, payTo, maxTimeoutSeconds };
+  return (Object.keys(kept).length ? { ...listed, extra: kept } : listed) as PaymentRequirements;
 }
 
 /**

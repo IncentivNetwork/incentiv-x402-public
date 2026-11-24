@@ -53,7 +53,7 @@ app.listen(4021);
 
 - Offer one or both schemes. A buyer pays with the first one it supports.
 - `price` is in USD and is paid in USDC. `maxTimeoutSeconds` is capped at 300; 120 is a good default.
-- The content is served only after the payment settles on chain.
+- The content is served only after payment settles. By default the handler can start before settlement. Set `extra: { paymentFlow: "upfront" }` on each payment option for routes that perform expensive work or have side effects. Upfront settlement charges before the handler starts and does not refund a later handler failure.
 - `@x402/next` (`withX402`, `paymentProxy`) and `@x402/hono` (`paymentMiddleware`) take the same `server`.
 
 ### Be discoverable

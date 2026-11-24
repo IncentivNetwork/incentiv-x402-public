@@ -1,11 +1,13 @@
+import { TransactionReceiptNotFoundError } from "viem";
 import type { Address, Hex } from "viem";
 import type { Network, PaymentPayload, PaymentRequirements, SchemeNetworkFacilitator, SettleResponse, VerifyResponse } from "@x402/core/types";
 import { erc20Abi, TRANSFER_GATE_REASONS, transferGateAbi } from "../abi.js";
 import { EOA_SCHEME, MAINNET, MAX_TIMEOUT_SECONDS, NETWORK, type IncentivConfig } from "../constants.js";
 import { checkPaysRequirements, checkUsdcPositive, logMessage, logToStderr, PaymentError, publicMessage } from "../decode.js";
 import { decodeEoaPayment, type DecodedEoaPayment } from "../eoa.js";
-import { MemoryStore, type SettledStore } from "../facilitator/store.js";
+import { settlementStore, type SettledStore } from "../facilitator/store.js";
 import { makeChain, nonceRefusal, refusedOnSubmit, SettleDeadlineError, withDeadline, type Chain } from "../userop.js";
+import { nonceUsedPastGrace, recordNonceUsed } from "../facilitator/claim-recovery.js";
 import type { EoaPaymentPayload } from "./client-eoa.js";
 import type { FacilitatorOptions } from "./facilitator.js";
 import type { TransactionReceipt } from "viem";
@@ -31,7 +33,7 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
   constructor(options: FacilitatorOptions = {}) {
     this.cfg = options.config ?? MAINNET;
     this.chain = makeChain(this.cfg);
-    this.store = options.store ?? new MemoryStore();
+    this.store = settlementStore(options.store);
     this.settleTimeoutMs = options.settleTimeoutMs ?? 60_000;
     this.pollIntervalMs = options.pollIntervalMs ?? 1_000;
     this.now = options.now ?? (() => Date.now());
@@ -119,11 +121,14 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
   }
 
   /** Checks against the chain: replay, one payment in flight, nonce, funds, simulation and TransferGate. */
-  private async checkChain(d: DecodedEoaPayment, opts: { rejectSettled: boolean; rejectBusy: boolean }): Promise<void> {
+  private async checkChain(d: DecodedEoaPayment, opts: { rejectSettled: boolean; rejectBusy: boolean; settleDeadline?: number }): Promise<void> {
     if (opts.rejectSettled && this.store.get(d.txHash)) throw new PaymentError("already_settled", "this transaction was already settled");
     if (opts.rejectBusy && this.busy.has(d.sender.toLowerCase())) throw new PaymentError("payer_busy", "another payment from this payer is being settled");
 
     const count = await this.chain.client.getTransactionCount({ address: d.sender, blockTag: "latest" });
+    if (count <= d.nonce && opts.settleDeadline !== undefined && this.now() < opts.settleDeadline) {
+      nonceUsedPastGrace(this.store, d.txHash, this.now, false, this.log);
+    }
     if (count !== d.nonce) throw new PaymentError("nonce_used", `account nonce is ${count}, transaction uses ${d.nonce}`);
 
     const [usdc, cent] = await Promise.all([
@@ -184,8 +189,8 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
   private async receipt(hash: Hex) {
     try {
       return await this.chain.client.getTransactionReceipt({ hash });
-    } catch {
-      return undefined;
+    } catch (e) {
+      return e instanceof TransactionReceiptNotFoundError ? null : undefined;
     }
   }
 
@@ -193,9 +198,9 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
    * Whether some transaction with this payment's nonce is on chain or in the node's mempool; undefined if the RPC
    * cannot say. Pending counts: a transaction the node accepted may land.
    */
-  private async nonceUsed(d: DecodedEoaPayment): Promise<boolean | undefined> {
+  private async nonceUsed(d: DecodedEoaPayment, blockTag: "pending" | "latest" = "pending"): Promise<boolean | undefined> {
     try {
-      return (await this.chain.client.getTransactionCount({ address: d.sender, blockTag: "pending" })) > d.nonce;
+      return (await this.chain.client.getTransactionCount({ address: d.sender, blockTag })) > d.nonce;
     } catch {
       return undefined;
     }
@@ -220,7 +225,7 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
   private async mayStillLand(d: DecodedEoaPayment, reason: string, deadline: number): Promise<boolean> {
     if (!this.store.isClaimed(d.txHash)) return false;
     if (reason === "nonce_used") return true;
-    return reason === "payment_expired" && (await this.within(deadline, () => this.nonceUsed(d))) !== false;
+    return reason === "payment_expired" && (this.store.isSubmitted(d.txHash) || (await this.within(deadline, () => this.nonceUsed(d))) !== false);
   }
 
   /** Waits one poll interval, or less if the deadline comes first. */
@@ -258,14 +263,43 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
     // The answer when no receipt shows up in time. While this facilitator holds the claim, a retry can still find
     // the receipt, so that answer is always settle_timeout.
     const noReceipt = this.fail("settle_timeout", "no receipt within the settle window; resend the same payload", d.sender);
+    const confirmedNonceUsed = !receipt && this.store.isSubmitted(d.txHash)
+      ? await this.within(deadline, () => this.nonceUsed(d, "latest"))
+      : undefined;
+    const pastGrace = nonceUsedPastGrace(this.store, d.txHash, this.now, confirmedNonceUsed, this.log);
+    if (receipt === null && pastGrace) {
+      const client = this.chain.client;
+      const snapshot = await this.within(deadline, () => client.getBlock({ blockTag: "latest" }));
+      const blockHash = snapshot?.hash;
+      if (!snapshot || !blockHash) return noReceipt;
+      const count = await this.within(deadline, () => client.getTransactionCount({ address: d.sender, blockHash, requireCanonical: true }));
+      if (count === undefined) return noReceipt;
+      if (count <= d.nonce) {
+        nonceUsedPastGrace(this.store, d.txHash, this.now, false, this.log);
+        return noReceipt;
+      }
+      receipt = await this.within(deadline, () => this.receipt(d.txHash));
+      if (receipt === null) {
+        const canonical = await this.within(deadline, () => client.getBlock({ blockNumber: snapshot.number }));
+        if (!canonical) return noReceipt;
+        if (canonical.hash !== blockHash) {
+          nonceUsedPastGrace(this.store, d.txHash, this.now, false, this.log);
+          return noReceipt;
+        }
+        const used = this.fail("nonce_used", "the confirmed nonce advanced and the payment receipt did not appear", d.sender);
+        return recordNonceUsed(this.store, d.txHash, used, noReceipt, this.log);
+      }
+      if (!receipt) return noReceipt;
+    }
     if (!receipt) {
       if (this.busy.has(sender)) return this.fail("payer_busy", "another payment from this payer is being settled", d.sender);
       this.busy.add(sender);
+      let holdsPayerLock = true;
       try {
         let submit = true;
         try {
           this.checkDeadline(d, req);
-          await withDeadline(this.checkChain(d, { rejectSettled: false, rejectBusy: false }), deadline - this.now());
+          await withDeadline(this.checkChain(d, { rejectSettled: false, rejectBusy: false, settleDeadline: deadline }), deadline - this.now());
         } catch (e) {
           if (e instanceof SettleDeadlineError) {
             this.log({ event: "settle_checks_timeout", hash: d.txHash });
@@ -281,7 +315,7 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
           // Whether an earlier settle submitted it and lost the answer: a copy of it may then be in a mempool.
           const claimedBefore = this.store.isClaimed(d.txHash);
           try {
-            this.store.claim(d.txHash);
+            this.store.claimForSubmission(d.txHash);
           } catch (e) {
             this.log({ event: "store_error", hash: d.txHash, error: logMessage(e) });
             return this.fail("store_unavailable", "the facilitator cannot record payments right now; nothing was submitted", d.sender);
@@ -296,14 +330,12 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
               // A refusal is final only when nothing says the payment may still land. A nonce refusal, or any refusal
               // of a resend after an earlier settle submitted it, keeps the claim without trusting a read: behind a
               // load-balanced RPC, the receipt and nonce reads can reach a node that has not seen the payment yet.
-              // A payment that never lands is answered payment_expired once its deadline passes (at most 300 s).
               receipt = await this.within(deadline, () => this.receipt(d.txHash));
               const used = receipt || nonceRefusal(message) || claimedBefore ? true : await this.within(deadline, () => this.nonceUsed(d));
               if (used === false) {
                 try {
                   this.store.release(d.txHash);
                 } catch (e) {
-                  // A claim that cannot be released only lingers until CLAIM_TTL_MS.
                   this.log({ event: "store_error", hash: d.txHash, error: logMessage(e) });
                 }
                 this.log({ event: "payment_error", reason: "tx_rejected", error: logMessage(e) });
@@ -318,13 +350,17 @@ export class IncentivEoaTxFacilitatorScheme implements SchemeNetworkFacilitator 
               this.log({ event: "submit_unknown", hash: d.txHash, error: logMessage(e) });
             }
           }
+        } else {
+          // This request only reads receipts. The hash-level guard still protects its settlement.
+          this.busy.delete(sender);
+          holdsPayerLock = false;
         }
         while (!receipt && this.now() < deadline) {
           await this.pause(deadline);
           receipt = await this.within(deadline, () => this.receipt(d.txHash));
         }
       } finally {
-        this.busy.delete(sender);
+        if (holdsPayerLock) this.busy.delete(sender);
       }
     }
     if (!receipt) return noReceipt;
