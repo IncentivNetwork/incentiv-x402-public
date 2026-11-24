@@ -1,12 +1,30 @@
 name: CI
 
+# Pull requests and main: typecheck, test and build on every supported platform.
+#
+# Release: a version tag on a commit of main deploys the facilitator.
+#   git tag v1.2.3 origin/main && git push origin v1.2.3   (or publish a release)
+# After the same checks pass, the image is built, tagged with the version, pushed
+# and rolled out by digest. A tag on a commit outside main is refused. To deploy
+# an earlier version again, run this workflow from its tag.
+#
+# The deploy job runs in the `prod` environment, which accepts only v* tags and
+# holds the deployment settings as variables (AWS_ROLE_ARN, AWS_REGION,
+# ECR_REPOSITORY, EKS_CLUSTER, K8S_NAMESPACE, K8S_DEPLOYMENT). Its credentials
+# can push this image and update this one deployment, nothing else.
 on:
   push:
     branches: [main]
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -29,3 +47,82 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  deploy:
+    name: Deploy
+    needs: test
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: prod
+    concurrency:
+      group: deploy-prod
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # OIDC token for the deployment role; this job only
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      EKS_CLUSTER: ${{ vars.EKS_CLUSTER }}
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+      K8S_DEPLOYMENT: ${{ vars.K8S_DEPLOYMENT }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check the release tag
+        run: |
+          set -euo pipefail
+          if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Releases are vX.Y.Z tags, not $GITHUB_REF_NAME"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME is not on main"
+            exit 1
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          mask-aws-account-id: true
+
+      # Image tags cannot be overwritten: deploying a version again reuses its image.
+      - name: Build and push the image
+        id: image
+        run: |
+          set -euo pipefail
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          REGISTRY="$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com"
+          TAG="$GITHUB_REF_NAME"
+          digest() {
+            aws ecr batch-get-image --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$TAG" \
+              --query 'images[0].imageId.imageDigest' --output text
+          }
+          DIGEST=$(digest)
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = None ]; then
+            aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+            docker build --pull -t "$REGISTRY/$ECR_REPOSITORY:$TAG" .
+            docker push "$REGISTRY/$ECR_REPOSITORY:$TAG"
+            docker logout "$REGISTRY"
+            DIGEST=$(digest)
+          else
+            echo "$TAG is already built, deploying the existing image"
+          fi
+          echo "ref=$REGISTRY/$ECR_REPOSITORY@$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Roll out
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_REGION" >/dev/null
+          CONTAINER=$(kubectl -n "$K8S_NAMESPACE" get deployment "$K8S_DEPLOYMENT" -o jsonpath='{.spec.template.spec.containers[0].name}')
+          kubectl -n "$K8S_NAMESPACE" set image deployment/"$K8S_DEPLOYMENT" "$CONTAINER=$IMAGE"
+          # One instance, replaced in place: the old one finishes its settles first (up to 70 s).
+          kubectl -n "$K8S_NAMESPACE" rollout status deployment/"$K8S_DEPLOYMENT" --timeout=5m
+          echo "Deployed $GITHUB_REF_NAME" >> "$GITHUB_STEP_SUMMARY"
