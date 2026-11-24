@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run a facilitator | x402 on Incentiv</title>
+<meta name="description" content="Run your own x402 facilitator for Incentiv: Docker, configuration, and operating rules.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231f5eff'/%3E%3Ctext x='16' y='22' font-size='16' font-family='sans-serif' font-weight='700' text-anchor='middle' fill='white'%3E402%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top"><div class="bar">
+  <a class="brand" href="/">x402 on Incentiv</a>
+  <nav>
+    <a href="/docs/">Overview</a>
+    <a href="/docs/sellers">Sell</a>
+    <a href="/docs/buyers">Buy</a>
+    <a href="/docs/api">API</a>
+    <a href="/docs/self-host" aria-current="page">Run a facilitator</a>
+    <a href="https://github.com/IncentivNetwork/incentiv-x402-public">GitHub</a>
+  </nav>
+</div></header>
+<main class="doc">
+  <h1>Run a facilitator</h1>
+  <p class="lead">Use <code>https://x402.incentiv.io</code>, or run your own instance. The facilitator holds no private key. It only submits payments that buyers already signed.</p>
+
+<pre><code>git clone https://github.com/IncentivNetwork/incentiv-x402-public
+cd incentiv-x402-public
+docker build -t incentiv-x402-facilitator .
+docker run -p 4020:4020 -v x402-data:/data incentiv-x402-facilitator</code></pre>
+
+  <div class="note warn">
+    <strong>Run exactly one instance, with persistent storage at <code>/data</code>.</strong> The facilitator keeps in memory which payments are being settled and which payers are mid-payment. Two instances would each believe they are the only claimant, and one payment could be reported as a success twice. Without persistent storage, a payment whose settle timed out just before a restart is refused on retry (<code>already_settled</code>), so its payer is charged but not served.
+  </div>
+
+  <h2>Configuration</h2>
+  <p>All settings are environment variables. Defaults are Incentiv mainnet.</p>
+  <table>
+    <tr><th>Variable</th><th>Default</th><th>Purpose</th></tr>
+    <tr><td><code>PORT</code></td><td><code>4020</code></td><td>Listening port</td></tr>
+    <tr><td><code>FACILITATOR_DATA_DIR</code></td><td><code>/data</code> in the image</td><td>Holds <code>settled.json</code> and <code>catalog.json</code>; mount a persistent volume here</td></tr>
+    <tr><td><code>INCENTIV_RPC_URL</code></td><td><code>https://rpc.incentiv.io</code></td><td>Chain RPC; use a dedicated endpoint in production</td></tr>
+    <tr><td><code>INCENTIV_BUNDLER_URL</code></td><td><code>https://bundler.incentiv.io</code></td><td>ERC-4337 bundler, used by <code>incentiv-userop</code></td></tr>
+    <tr><td><code>DISCOVERY</code></td><td><code>off</code></td><td><code>on</code> turns on the Bazaar catalog and <code>/discovery/*</code></td></tr>
+    <tr><td><code>TRUST_PROXY</code></td><td>unset</td><td>Set to <code>1</code> behind one load balancer, so rate limits count real client addresses. <code>true</code> is refused.</td></tr>
+    <tr><td><code>VERIFY_PER_MINUTE</code></td><td><code>120</code></td><td>Per-address limit on <code>/verify</code></td></tr>
+    <tr><td><code>SETTLE_PER_MINUTE</code></td><td><code>60</code></td><td>Per-address limit on <code>/settle</code></td></tr>
+    <tr><td><code>DISCOVERY_PER_MINUTE</code></td><td><code>120</code></td><td>Per-address limit on <code>/discovery/*</code></td></tr>
+  </table>
+
+  <h2>Operating notes</h2>
+  <ul>
+    <li><strong>Health check.</strong> <code>GET /health</code> returns 200 when the RPC and the bundler both answer, and 503 otherwise. The image has a built-in container health check.</li>
+    <li><strong>TLS.</strong> Terminate TLS at a load balancer or proxy in front.</li>
+    <li><strong>Shutdown.</strong> On SIGTERM it stops accepting requests and waits up to 70 seconds, because a settle can wait up to 60 seconds for a receipt. Set your orchestrator's stop timeout to at least 75 seconds.</li>
+    <li><strong>Logs.</strong> One JSON line per settle (<code>event: "settle"</code>, scheme, success, reason, transaction, payer, amount) and per start or stop, on stdout.</li>
+  </ul>
+
+  <h2>After deploying</h2>
+  <ol>
+    <li>Open <code>/health</code> and <code>/supported</code> on your host.</li>
+    <li>Run <code>npm run e2e</code> against it with a funded test payer. It spends real funds on mainnet.</li>
+    <li>Give sellers your URL to use as their facilitator.</li>
+  </ol>
+  <p>More detail: <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/docs/DEPLOY.md">docs/DEPLOY.md</a>.</p>
+</main>
+<footer><div class="bar">
+  <span>MIT licensed</span>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public">Source</a>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/docs/SPEC.md">Protocol spec</a>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/SECURITY.md">Security</a>
+</div></footer>
+</body>
+</html>

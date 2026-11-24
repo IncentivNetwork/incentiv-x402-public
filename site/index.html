@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>x402 on Incentiv</title>
+<meta name="description" content="Accept and make HTTP 402 payments in USDC on Incentiv. Stock x402 packages, one extra scheme, and a public facilitator.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231f5eff'/%3E%3Ctext x='16' y='22' font-size='16' font-family='sans-serif' font-weight='700' text-anchor='middle' fill='white'%3E402%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top"><div class="bar">
+  <a class="brand" href="/">x402 on Incentiv</a>
+  <nav>
+    <a href="/docs/">Overview</a>
+    <a href="/docs/sellers">Sell</a>
+    <a href="/docs/buyers">Buy</a>
+    <a href="/docs/api">API</a>
+    <a href="/docs/self-host">Run a facilitator</a>
+    <a href="https://github.com/IncentivNetwork/incentiv-x402-public">GitHub</a>
+  </nav>
+</div></header>
+<main>
+  <section class="hero">
+    <h1>x402 on Incentiv</h1>
+    <p class="lead">x402 payments in USDC on Incentiv. Sellers and buyers use the stock <code>@x402</code> packages and register one Incentiv scheme. The facilitator at <code>https://x402.incentiv.io</code> verifies and settles the payments.</p>
+    <div class="cta">
+      <a class="btn primary" href="/docs/sellers">Sell: protect a route</a>
+      <a class="btn" href="/docs/buyers">Buy: pay for a route</a>
+      <a class="btn" href="/docs/api">Facilitator API</a>
+    </div>
+  </section>
+
+  <h2>Network</h2>
+  <table>
+    <tr><th>Facilitator URL</th><td><code>https://x402.incentiv.io</code></td></tr>
+    <tr><th>Network</th><td><code>eip155:24101</code> (Incentiv mainnet, chain ID 24101). Incentiv has no testnet.</td></tr>
+    <tr><th>RPC</th><td><code>https://rpc.incentiv.io</code></td></tr>
+    <tr><th>Asset</th><td>USDC <code>0x16e43840d8D79896A389a3De85aB0B0210C05685</code>, 6 decimals</td></tr>
+    <tr><th>x402 version</th><td>2</td></tr>
+    <tr><th>Facilitator fee</th><td>None. The buyer pays gas on top of the price.</td></tr>
+    <tr><th>Package</th><td><code>@incentiv/x402</code> (MIT)</td></tr>
+  </table>
+
+  <h2>Two schemes</h2>
+  <div class="grid">
+    <div class="card">
+      <h3><code>incentiv-eoa-tx</code></h3>
+      <p>The payer is a plain wallet. It signs a USDC transfer and pays gas in CENT.</p>
+    </div>
+    <div class="card">
+      <h3><code>incentiv-userop</code></h3>
+      <p>The payer is an Incentiv smart account. It signs an ERC-4337 user operation and pays gas in USDC through the Unified Token Paymaster, or in CENT from the account.</p>
+    </div>
+  </div>
+  <p>These are custom schemes, so a buyer needs <code>@incentiv/x402</code> to pay. The standard <code>exact</code> scheme cannot run on Incentiv today; see <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/docs/SPEC.md#9-why-not-exact">why</a>.</p>
+
+  <h2>How it works</h2>
+  <div class="flow"><ol>
+    <li>The buyer requests a paid route. The seller answers <code>402</code> with a <code>PAYMENT-REQUIRED</code> header.</li>
+    <li>The buyer signs the exact payment that was quoted and retries with a <code>PAYMENT-SIGNATURE</code> header.</li>
+    <li>The seller asks the facilitator to <code>/verify</code> and <code>/settle</code> it.</li>
+    <li>The seller serves the content once <code>/settle</code> reports <code>success: true</code>.</li>
+  </ol></div>
+  <p>The facilitator holds no private key. It only submits payments that buyers already signed.</p>
+
+</main>
+<footer><div class="bar">
+  <span>MIT licensed</span>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public">Source</a>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/docs/SPEC.md">Protocol spec</a>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/SECURITY.md">Security</a>
+  <a href="https://x402.org">x402.org</a>
+  <a href="https://incentiv.io">incentiv.io</a>
+</div></footer>
+</body>
+</html>

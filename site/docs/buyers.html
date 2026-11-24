@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Buyer quickstart | x402 on Incentiv</title>
+<meta name="description" content="Pay for x402 routes in USDC on Incentiv from a wallet or a smart account.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231f5eff'/%3E%3Ctext x='16' y='22' font-size='16' font-family='sans-serif' font-weight='700' text-anchor='middle' fill='white'%3E402%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top"><div class="bar">
+  <a class="brand" href="/">x402 on Incentiv</a>
+  <nav>
+    <a href="/docs/">Overview</a>
+    <a href="/docs/sellers">Sell</a>
+    <a href="/docs/buyers" aria-current="page">Buy</a>
+    <a href="/docs/api">API</a>
+    <a href="/docs/self-host">Run a facilitator</a>
+    <a href="https://github.com/IncentivNetwork/incentiv-x402-public">GitHub</a>
+  </nav>
+</div></header>
+<main class="doc">
+  <h1>Buyer quickstart</h1>
+  <p class="lead">Pay for an x402 route in USDC on Incentiv.</p>
+
+  <h2>Prerequisites</h2>
+  <table>
+    <tr><th>Requirement</th><th>Notes</th></tr>
+    <tr><td>A payer key</td><td>An EOA, or the owner key of an Incentiv smart account</td></tr>
+    <tr><td>USDC on Incentiv</td><td>Plus CENT for gas when paying from an EOA; see <a href="#funding">funding</a></td></tr>
+    <tr><td>Node.js 22.18 or later</td><td></td></tr>
+  </table>
+
+  <h2>Steps</h2>
+
+  <ol class="steps">
+    <li>
+      <strong>Install.</strong>
+      <pre><code>npm install @incentiv/x402</code></pre>
+    </li>
+    <li>
+      <strong>Fund the payer.</strong> See <a href="#funding">funding</a> below. An EOA needs USDC for the price and CENT for gas. A smart account needs USDC for both.
+    </li>
+    <li>
+      <strong>Pay from a wallet (EOA).</strong>
+<pre><code>import { x402Client } from "@x402/core/client";
+import { wrapFetchWithPayment } from "@x402/fetch";
+import { privateKeyToAccount } from "viem/accounts";
+import { IncentivEoaTxClientScheme } from "@incentiv/x402";
+
+const client = new x402Client();
+client.register(
+  "eip155:24101",
+  new IncentivEoaTxClientScheme({
+    owner: privateKeyToAccount(process.env.PAYER_KEY as `0x${string}`),
+  }),
+);
+
+const fetchWithPayment = wrapFetchWithPayment(fetch, client);
+const res = await fetchWithPayment("https://api.example.com/weather");</code></pre>
+    </li>
+    <li>
+      <strong>Or pay from a smart account.</strong> Register <code>IncentivUserOpClientScheme</code> instead.
+<pre><code>import { IncentivUserOpClientScheme } from "@incentiv/x402";
+
+// gas: "token" (USDC, the default) or "native" (CENT)
+const scheme = new IncentivUserOpClientScheme({ owner, gas: "token" });
+client.register("eip155:24101", scheme);
+console.log(await scheme.account()); // the smart account that pays</code></pre>
+    </li>
+  </ol>
+
+  <h2 id="funding">Funding a payer</h2>
+  <table>
+    <tr><th>Payer</th><th>Holds</th><th>Address</th></tr>
+    <tr><td>EOA (<code>incentiv-eoa-tx</code>)</td><td>USDC for prices, CENT for gas</td><td>Your wallet address, the same on every chain</td></tr>
+    <tr><td>Smart account (<code>incentiv-userop</code>)</td><td>USDC for prices and, by default, gas</td><td>Derived from your key; it exists <strong>only on Incentiv</strong></td></tr>
+  </table>
+  <div class="note warn">
+    <strong>Fund the smart account on Incentiv only.</strong> Its address has no contract on other chains, so funds sent to it on Ethereum or elsewhere cannot be moved by your key. To bridge in, set it as the recipient in the Incentiv Bridge. Run <code>scheme.account()</code> to get the address.
+  </div>
+  <p>An EOA can have one payment settling at a time, and cannot pay while it has a pending transaction. A smart account can have many payments in flight, because each uses its own nonce lane.</p>
+
+  <h2>Client checks</h2>
+  <p>Both clients decode what they are about to sign and refuse anything that is not exactly the quoted payment. The smart-account client also enforces gas caps:</p>
+  <table>
+    <tr><th>Mode</th><th>Cap</th><th>Default</th></tr>
+    <tr><td><code>gas: "token"</code></td><td><code>maxGasFee</code>, in USDC atomic units. Gas in any token other than USDC is refused.</td><td><code>250_000n</code> (0.25 USDC)</td></tr>
+    <tr><td><code>gas: "native"</code></td><td><code>maxNativeGasCost</code>, in CENT wei</td><td>100 CENT (<code>DEFAULT_MAX_NATIVE_GAS_COST</code>)</td></tr>
+  </table>
+
+  <h2>Costs</h2>
+  <p>The buyer pays gas on top of the price. On 2026-11-19, a payment cost about 2 CENT of gas from an EOA, or about 0.03 USDC through the paymaster, whose minimum is 0.026 USDC.</p>
+
+</main>
+<footer><div class="bar">
+  <span>MIT licensed</span>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public">Source</a>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/docs/SPEC.md">Protocol spec</a>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/SECURITY.md">Security</a>
+</div></footer>
+</body>
+</html>

@@ -14,6 +14,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 COPY --from=build /app/dist ./dist
+COPY site ./site
 RUN mkdir -p /data && chown -R node:node /data /app
 USER node
 VOLUME /data

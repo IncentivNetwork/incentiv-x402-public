@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API reference | x402 on Incentiv</title>
+<meta name="description" content="The x402 facilitator API on Incentiv: /supported, /verify, /settle, /health, discovery, and reason codes.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231f5eff'/%3E%3Ctext x='16' y='22' font-size='16' font-family='sans-serif' font-weight='700' text-anchor='middle' fill='white'%3E402%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top"><div class="bar">
+  <a class="brand" href="/">x402 on Incentiv</a>
+  <nav>
+    <a href="/docs/">Overview</a>
+    <a href="/docs/sellers">Sell</a>
+    <a href="/docs/buyers">Buy</a>
+    <a href="/docs/api" aria-current="page">API</a>
+    <a href="/docs/self-host">Run a facilitator</a>
+    <a href="https://github.com/IncentivNetwork/incentiv-x402-public">GitHub</a>
+  </nav>
+</div></header>
+<main class="doc">
+  <h1>Facilitator API</h1>
+  <p class="lead">Base URL <code>https://x402.incentiv.io</code>. It follows the x402 v2 facilitator API for the network <code>eip155:24101</code> and the schemes <code>incentiv-eoa-tx</code> and <code>incentiv-userop</code>. The full rules are in the <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/docs/SPEC.md">protocol spec</a>.</p>
+
+  <h2>Endpoints</h2>
+  <table>
+    <tr><th>Method and path</th><th>Purpose</th></tr>
+    <tr><td><code>GET /supported</code></td><td>Schemes and extensions on offer</td></tr>
+    <tr><td><code>POST /verify</code></td><td>Check a signed payment without changing any state</td></tr>
+    <tr><td><code>POST /settle</code></td><td>Submit the payment and wait for its receipt (up to 60 seconds)</td></tr>
+    <tr><td><code>GET /health</code></td><td>RPC and bundler status</td></tr>
+    <tr><td><code>GET /discovery/resources</code></td><td>List cataloged paid resources (only when the facilitator runs with discovery on)</td></tr>
+    <tr><td><code>GET /discovery/search</code></td><td>Search cataloged resources (only with discovery on)</td></tr>
+  </table>
+
+  <h2>GET /supported</h2>
+<pre><code>curl https://x402.incentiv.io/supported</code></pre>
+<pre><code>{
+  "kinds": [
+    { "x402Version": 2, "scheme": "incentiv-eoa-tx", "network": "eip155:24101" },
+    { "x402Version": 2, "scheme": "incentiv-userop", "network": "eip155:24101" }
+  ],
+  "extensions": [],
+  "signers": { "eip155:24101": [] }
+}</code></pre>
+  <p><code>extensions</code> lists <code>"bazaar"</code> only when discovery is on. <code>signers</code> is empty because the facilitator holds no signing key.</p>
+
+  <h2>POST /verify</h2>
+<pre><code>curl -X POST https://x402.incentiv.io/verify \
+  -H "content-type: application/json" \
+  -d @payment.json</code></pre>
+  <p>Request body, for an <code>incentiv-eoa-tx</code> payment of 0.01 USDC:</p>
+<pre><code>{
+  "x402Version": 2,
+  "paymentPayload": {
+    "x402Version": 2,
+    "resource": {
+      "url": "https://api.example.com/weather",
+      "description": "Current weather",
+      "mimeType": "application/json"
+    },
+    "accepted": {
+      "scheme": "incentiv-eoa-tx",
+      "network": "eip155:24101",
+      "amount": "10000",
+      "asset": "0x16e43840d8D79896A389a3De85aB0B0210C05685",
+      "payTo": "0xYourIncentivAddress",
+      "maxTimeoutSeconds": 120,
+      "extra": {}
+    },
+    "payload": {
+      "signedTransaction": "0x02f8cb825e25…"
+    }
+  },
+  "paymentRequirements": {
+    "scheme": "incentiv-eoa-tx",
+    "network": "eip155:24101",
+    "amount": "10000",
+    "asset": "0x16e43840d8D79896A389a3De85aB0B0210C05685",
+    "payTo": "0xYourIncentivAddress",
+    "maxTimeoutSeconds": 120,
+    "extra": {}
+  }
+}</code></pre>
+  <ul>
+    <li><code>paymentRequirements</code> is the option the buyer chose from the seller's <code>PAYMENT-REQUIRED</code> header. <code>paymentPayload.accepted</code> must equal it.</li>
+    <li><code>paymentPayload</code> is the buyer's <code>PAYMENT-SIGNATURE</code> header, base64-decoded.</li>
+    <li>For <code>incentiv-userop</code>, <code>extra</code> is <code>{ "entryPoint": "0x3eC61c5633BBD7Afa9144C6610930489736a72d4" }</code> and <code>payload</code> holds <code>userOperation</code>, <code>userOpHash</code>, <code>paymentId</code> and <code>validUntil</code>. See the <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/docs/SPEC.md#42-payload">spec</a>.</li>
+  </ul>
+  <p>Response (HTTP 200 for every payment outcome):</p>
+<pre><code>{ "isValid": true, "payer": "0x…" }</code></pre>
+<pre><code>{
+  "isValid": false,
+  "invalidReason": "insufficient_funds",
+  "invalidMessage": "USDC balance 0 is below 10000"
+}</code></pre>
+
+  <h2>POST /settle</h2>
+  <p>The same body as <code>/verify</code>. It repeats every check, submits the payment, and waits for a receipt.</p>
+<pre><code>curl -X POST https://x402.incentiv.io/settle \
+  -H "content-type: application/json" \
+  -d @payment.json</code></pre>
+<pre><code>{
+  "success": true,
+  "transaction": "0x…",
+  "network": "eip155:24101",
+  "payer": "0x…",
+  "amount": "10000"
+}</code></pre>
+<pre><code>{
+  "success": false,
+  "errorReason": "insufficient_funds",
+  "errorMessage": "USDC balance 0 is below 10000",
+  "payer": "0x…",
+  "transaction": "",
+  "network": "eip155:24101"
+}</code></pre>
+  <ul>
+    <li>Serve the content only after <code>success: true</code>.</li>
+    <li>After <code>settle_timeout</code>, retry the same payload. Do not ask the buyer to sign again.</li>
+    <li>A payment is reported as a success to at most one <code>/settle</code> call. Others get <code>already_settled</code> or <code>already_settling</code>.</li>
+  </ul>
+
+  <h2>GET /health</h2>
+<pre><code>200 { "status": "ok", "rpc": "ok", "bundler": "ok" }
+503 { "status": "degraded", "rpc": "down", "bundler": "ok" }</code></pre>
+
+  <h2>Discovery</h2>
+  <table>
+    <tr><th>Path</th><th>Query</th><th>Response</th></tr>
+    <tr><td><code>/discovery/resources</code></td><td><code>type</code>, <code>payTo</code>, <code>scheme</code>, <code>network</code>, <code>limit</code> (at most 100), <code>offset</code></td><td><code>{ x402Version: 2, items, pagination }</code></td></tr>
+    <tr><td><code>/discovery/search</code></td><td><code>query</code> (at most 200 characters), plus the same filters and <code>limit</code></td><td><code>{ x402Version: 2, resources, partialResults, pagination: null }</code></td></tr>
+  </table>
+  <p>A resource is cataloged when a payment for it settles and its route declared Bazaar discovery info. There is no manual registration. Listings are not authenticated: the details of an entry come from whoever pays. Do not trust them without checking the resource's live <code>402</code>.</p>
+
+  <h2>Errors and limits</h2>
+  <table>
+    <tr><th>Status</th><th>Body</th><th>When</th></tr>
+    <tr><td>400</td><td><code>{"error":"invalid_request"}</code></td><td>No <code>paymentPayload</code> or <code>paymentRequirements</code>, or a bad JSON body</td></tr>
+    <tr><td>400</td><td><code>{"error":"unsupported_scheme"}</code></td><td>A scheme, network or x402 version the facilitator does not serve</td></tr>
+    <tr><td>404</td><td><code>{"error":"not_found"}</code></td><td>A path the service does not serve</td></tr>
+    <tr><td>429</td><td><code>{"error":"rate_limited"}</code></td><td>Over the per-address limit: 120 <code>/verify</code>, 60 <code>/settle</code> and, with discovery on, 120 <code>/discovery/*</code> calls per minute (defaults)</td></tr>
+    <tr><td>500</td><td><code>{"error":"internal_error"}</code></td><td>An unexpected error. The body never carries a stack trace.</td></tr>
+  </table>
+  <p>The request body is limited to 64 KB.</p>
+
+  <h2 id="reason-codes">Reason codes</h2>
+  <table>
+    <tr><th>Code</th><th>Meaning</th></tr>
+    <tr><td><code>invalid_x402_version</code></td><td>Not x402 v2</td></tr>
+    <tr><td><code>invalid_scheme</code>, <code>invalid_network</code></td><td>Wrong scheme or network</td></tr>
+    <tr><td><code>invalid_payment_requirements</code></td><td><code>accepted</code> differs from the requirements, an unexpected EntryPoint, or a deadline beyond the allowed window</td></tr>
+    <tr><td><code>invalid_payload</code></td><td>Malformed or non-canonical payload, or calls other than the allowed forms</td></tr>
+    <tr><td><code>invalid_signature</code></td><td>The signature does not authorize this payment</td></tr>
+    <tr><td><code>payment_expired</code></td><td><code>validUntil</code> has passed</td></tr>
+    <tr><td><code>asset_mismatch</code>, <code>payto_mismatch</code>, <code>amount_mismatch</code></td><td>The payment is not the one quoted</td></tr>
+    <tr><td><code>nonce_used</code></td><td>The nonce has moved on</td></tr>
+    <tr><td><code>payer_busy</code></td><td>Another payment from the same EOA is being settled</td></tr>
+    <tr><td><code>insufficient_funds</code></td><td>Not enough USDC for the payment, or not enough CENT or USDC for gas</td></tr>
+    <tr><td><code>transfer_gate_pending</code>, <code>transfer_gate_blocked</code>, <code>transfer_gate_unavailable</code></td><td>TransferGate would escrow or block the transfer, or could not be read</td></tr>
+    <tr><td><code>simulation_failed</code></td><td>The transfer or the operation fails in simulation</td></tr>
+    <tr><td><code>already_settled</code>, <code>already_settling</code></td><td>The payment was already reported to another request</td></tr>
+    <tr><td><code>settle_timeout</code></td><td>No receipt within 60 seconds, or the checks did not finish in time. Retry the same payload.</td></tr>
+    <tr><td><code>tx_rejected</code>, <code>tx_reverted</code></td><td>The RPC rejected the transaction, or it reverted</td></tr>
+    <tr><td><code>userop_rejected</code>, <code>userop_reverted</code></td><td>The bundler rejected the operation, or it reverted</td></tr>
+    <tr><td><code>payment_transfer_missing</code></td><td>The receipt does not prove the exact USDC transfer for this payment</td></tr>
+    <tr><td><code>settle_unrecorded</code></td><td>The payment executed but could not be recorded. Retry the same payload.</td></tr>
+    <tr><td><code>store_unavailable</code></td><td>The facilitator cannot record claims; nothing was submitted</td></tr>
+    <tr><td><code>unexpected_verify_error</code>, <code>unexpected_settle_error</code></td><td>An internal error</td></tr>
+  </table>
+</main>
+<footer><div class="bar">
+  <span>MIT licensed</span>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public">Source</a>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/docs/SPEC.md">Protocol spec</a>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/SECURITY.md">Security</a>
+</div></footer>
+</body>
+</html>
