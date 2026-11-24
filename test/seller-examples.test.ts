@@ -19,11 +19,11 @@ function decodeHtml(code: string): string {
 
 function sellerExamples(): string[] {
   const examples: string[] = [];
-  const readme = readFileSync(join(root, "README.md"), "utf8");
+  const readme = readFileSync(join(root, "README.md"), "utf8").replaceAll("\r\n", "\n");
   for (const [, code] of readme.matchAll(/```ts\n([\s\S]*?)```/g)) {
     if (code!.includes("server.register(NETWORK")) examples.push(code!);
   }
-  const sellers = readFileSync(join(root, "site", "docs", "sellers.html"), "utf8");
+  const sellers = readFileSync(join(root, "site", "docs", "sellers.html"), "utf8").replaceAll("\r\n", "\n");
   for (const [, code] of sellers.matchAll(/<pre><code>([\s\S]*?)<\/code><\/pre>/g)) {
     const decoded = decodeHtml(code!);
     if (decoded.includes("server.register(NETWORK")) examples.push(decoded);
