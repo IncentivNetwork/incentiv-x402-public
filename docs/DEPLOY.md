@@ -56,7 +56,9 @@ All settings are environment variables. Defaults are Incentiv mainnet.
 
 - Configure the facilitator Deployment in your infrastructure with `replicas: 1` and `strategy.type: Recreate`. Use a persistent volume mounted at the facilitator's data directory and keep autoscaling disabled. A release waits for the old revision to terminate before starting the new one, so plan for a short interruption. During maintenance, avoid deleting a running pod directly: the ReplicaSet can start a replacement before termination finishes. Use a Deployment rollout or scale to zero and confirm the old process has stopped before scaling back up.
 - Use SIGTERM and set `terminationGracePeriodSeconds` to at least 75 in the pod template. If the facilitator has a `preStop` hook, use a Kubernetes `sleep` handler and add its full duration to that minimum. Apply these settings and confirm the running pod uses them before enabling the release workflow. Changing a template does not extend the grace period of an existing pod.
-- Set the `prod` environment variable `K8S_CONTAINER` to the facilitator container name. The release workflow checks the Deployment's rollout and shutdown settings before updating that container.
+- Before the first release and after changing infrastructure, verify that the running pod mounts the intended persistent storage read-write at `FACILITATOR_DATA_DIR` (`/data` by default). If using a persistent volume claim, verify the claim is bound and the running pod and Deployment template reference the same claim.
+- Configure the facilitator container's HTTP `readinessProbe` to GET `/health` on its listening port (`4020` by default). Use the pod IP and allow enough time for the RPC and bundler checks. The rollout waits for Kubernetes to report the new pod as available. Use the service endpoint checks below to verify traffic through the load balancer.
+- Set the `prod` environment variable `K8S_CONTAINER` to the facilitator container name. The release workflow checks the Deployment template's rollout, readiness and shutdown settings before updating that container.
 
 ### Release a version
 

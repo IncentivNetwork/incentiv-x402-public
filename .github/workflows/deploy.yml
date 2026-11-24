@@ -122,6 +122,12 @@ jobs:
             echo '::error::K8S_CONTAINER does not name a container in the Deployment'
             exit 1
           fi
+          if ! jq -e '
+            .readinessProbe.httpGet | .path == "/health" and (.scheme // "HTTP") == "HTTP" and (.host // "") == ""
+          ' <<< "$CONTAINER" >/dev/null; then
+            echo '::error::Configure an HTTP readiness probe to /health on the facilitator pod'
+            exit 1
+          fi
           GRACE=$(jq '.spec.template.spec.terminationGracePeriodSeconds // 0' <<< "$LIVE")
           if ! jq -e --argjson grace "$GRACE" '
             (.lifecycle.stopSignal // "SIGTERM") == "SIGTERM" and
