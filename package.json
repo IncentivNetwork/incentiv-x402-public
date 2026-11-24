@@ -73,10 +73,10 @@
     "start": "node dist/facilitator/main.js"
   },
   "dependencies": {
-    "@x402/core": "2.31.0",
-    "@x402/express": "2.31.0",
-    "@x402/extensions": "2.31.0",
-    "@x402/fetch": "2.31.0",
+    "@x402/core": "2.32.0",
+    "@x402/express": "2.32.0",
+    "@x402/extensions": "2.32.0",
+    "@x402/fetch": "2.32.0",
     "express": "^5.1.0",
     "viem": "2.55.4"
   },
