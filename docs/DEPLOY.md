@@ -74,7 +74,7 @@ Keep staged `candidate-*` images until their versions are published so a rerun c
 
 Production deployments run one at a time. Each image update records the highest requested version in `x402.incentiv.io/highest-release` and the newest requested source commit by Git ancestry in `x402.incentiv.io/newest-release-commit`, even if the rollout fails. Keep both Deployment annotations when applying infrastructure changes. When adopting this workflow for an existing release, seed them from its verified version and commit. If only the version is present, the workflow resolves its immutable Git tag.
 
-A normal release uses the same or a higher version and the same source commit or a descendant. Each annotation retains its highest value through a rollback, so pending runs still have to meet both checks.
+To rerun a release, use its immutable tag and original commit. For a new release after the first, create a higher version tag on the newest requested source commit or a descendant. Both limits continue to apply to normal releases after a rollback.
 
 ### Roll back a release
 
