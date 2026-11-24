@@ -55,8 +55,14 @@ All settings are environment variables. Defaults are Incentiv mainnet.
 ## Kubernetes on EKS
 
 - Configure the facilitator Deployment in your infrastructure with `replicas: 1` and `strategy.type: Recreate`. Use a persistent volume mounted at the facilitator's data directory and keep autoscaling disabled. A release waits for the old revision to terminate before starting the new one, so plan for a short interruption. During maintenance, avoid deleting a running pod directly: the ReplicaSet can start a replacement before termination finishes. Use a Deployment rollout or scale to zero and confirm the old process has stopped before scaling back up.
-- Use SIGTERM and set `terminationGracePeriodSeconds` to at least 75 in the pod template. If the facilitator has a `preStop` hook, use a Kubernetes `sleep` handler and add its full duration to that minimum. Apply these settings and confirm the running pod uses them before enabling automated releases. Changing a template does not extend the grace period of an existing pod.
+- Use SIGTERM and set `terminationGracePeriodSeconds` to at least 75 in the pod template. If the facilitator has a `preStop` hook, use a Kubernetes `sleep` handler and add its full duration to that minimum. Apply these settings and confirm the running pod uses them before enabling the release workflow. Changing a template does not extend the grace period of an existing pod.
 - Set the `prod` environment variable `K8S_CONTAINER` to the facilitator container name. The release workflow checks the Deployment's rollout and shutdown settings before updating that container.
+
+### Release a version
+
+Protect `main` with PR review and restrict the GitHub `prod` environment to the **branch** `main` only. Remove any tag policies from that environment. Configure the AWS role to require the repository's exact `prod` OIDC subject and the `sts.amazonaws.com` audience. Use the immutable subject with owner and repository IDs when enabled in the repository's OIDC settings. Limit the role to the configured ECR repository and EKS cluster, and limit its Kubernetes access to the facilitator Deployment. Enable immutable image tags on the ECR repository and protect Git release tags from updates and deletion.
+
+Set `AWS_ROLE_ARN`, `AWS_REGION`, `ECR_REPOSITORY`, `EKS_CLUSTER`, `K8S_NAMESPACE`, `K8S_DEPLOYMENT` and `K8S_CONTAINER` as variables in `prod`. Push a `vX.Y.Z` tag on a commit already on `main`. Run **Deploy facilitator** from `main` in GitHub Actions with that tag, or use `gh workflow run deploy.yml --ref main -f tag=vX.Y.Z`. The workflow tests the tagged commit using the current CI matrix before building or reusing the immutable image and deploying by digest. Tag creation by itself does not start a release.
 
 ## Endpoints
 
