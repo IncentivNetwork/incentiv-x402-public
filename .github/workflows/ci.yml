@@ -44,3 +44,4 @@ jobs:
         run: |
           bash .github/scripts/test-publish-facilitator.sh
           bash .github/scripts/test-facilitator-readiness.sh
+          bash .github/scripts/test-release-order.sh
