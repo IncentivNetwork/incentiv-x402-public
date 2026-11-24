@@ -33,7 +33,10 @@ function sellerExamples(): string[] {
 
 test("every seller example declares the network literal", () => {
   const examples = sellerExamples();
-  assert.equal(examples.length, 4, "expected the README example and the Express, Next.js and Hono examples");
+  assert.ok(examples.length >= 4, "expected the README example and the Express, Next.js and Hono examples");
+  assert.ok(examples.some((code) => code.includes('import express from "express";')), "Express seller example not found");
+  assert.ok(examples.some((code) => code.includes('import { withX402 } from "@x402/next";')), "Next.js seller example not found");
+  assert.ok(examples.some((code) => code.includes('import { paymentMiddleware } from "@x402/hono";')), "Hono seller example not found");
   for (const example of examples) {
     assert.ok(example.includes(NETWORK_DECLARATION), "seller example must declare NETWORK with as const");
     assert.ok(!example.includes(NETWORK_DECLARATION_WITHOUT_CONST), "seller example must not declare NETWORK as a mutable string");
