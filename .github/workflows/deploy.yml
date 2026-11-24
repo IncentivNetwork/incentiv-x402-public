@@ -11,6 +11,9 @@ on:
         description: Allow deploying an older version or source commit with a verified image
         type: boolean
         default: false
+      rollback_from:
+        description: Expected Deployment UID:generation for a rollback
+        type: string
 
 permissions:
   contents: read
@@ -78,6 +81,7 @@ jobs:
       TAG: ${{ needs.release.outputs.tag }}
       COMMIT: ${{ needs.release.outputs.commit }}
       ROLLBACK: ${{ inputs.rollback }}
+      ROLLBACK_FROM: ${{ inputs.rollback_from }}
       AWS_REGION: ${{ vars.AWS_REGION }}
       ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
       EKS_CLUSTER: ${{ vars.EKS_CLUSTER }}

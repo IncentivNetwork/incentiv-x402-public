@@ -74,7 +74,18 @@ Keep staged `candidate-*` images until their versions are published so a rerun c
 
 Production deployments run one at a time. Each image update records the highest requested version in `x402.incentiv.io/highest-release` and the newest requested source commit by Git ancestry in `x402.incentiv.io/newest-release-commit`, even if the rollout fails. Keep both Deployment annotations when applying infrastructure changes. When adopting this workflow for an existing release, seed them from its verified version and commit. If only the version is present, the workflow resolves its immutable Git tag.
 
-A normal release uses the same or a higher version and the same source commit or a descendant. To deploy a lower version or an older source commit, select a tag with a verified existing ECR image and set `rollback` to `true`. Each annotation retains its highest value through a rollback, so pending runs still have to meet both checks.
+A normal release uses the same or a higher version and the same source commit or a descendant. Each annotation retains its highest value through a rollback, so pending runs still have to meet both checks.
+
+### Roll back a release
+
+Select a tag with a verified existing ECR image. Inspect the Deployment's current image and copy its `UID:generation` from the same read. Substitute your namespace and Deployment name in this command.
+
+```bash
+kubectl -n x402 get deployment facilitator \
+  -o go-template='{{.metadata.uid}}:{{.metadata.generation}}{{"\n"}}{{range .spec.template.spec.containers}}{{.name}} {{.image}}{{"\n"}}{{end}}'
+```
+
+Dispatch **Deploy facilitator** from `main` with the target tag, `rollback` set to `true`, and the inspected value in `rollback_from`. The workflow checks that the Deployment UID and generation still match. If either differs, inspect the new release before dispatching another rollback.
 
 Release and rollback commits must include `c81d10f`, the release baseline with durable submission recovery and the publication fixes. Check rollback compatibility using a staging copy of the current data before rolling back. When changing the persisted format, verify that supported rollback versions can read and preserve the new data. If they cannot, plan a migration that keeps settlement records intact and update the workflow's release baseline before enabling the new format in production.
 

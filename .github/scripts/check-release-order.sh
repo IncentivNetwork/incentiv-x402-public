@@ -7,6 +7,18 @@ fail() {
 }
 
 deployment=$(cat)
+rollback_from=${ROLLBACK_FROM:-}
+if [[ "$ROLLBACK" == true ]]; then
+  [[ -n "$rollback_from" ]] || fail 'Set rollback_from to the inspected Deployment UID:generation'
+  revision=$(jq -er '
+    .metadata | select((.uid | type) == "string" and .uid != "" and (.generation | type) == "number" and .generation >= 1)
+    | "\(.uid):\(.generation)"
+  ' <<< "$deployment") || fail 'Cannot determine the current Deployment UID and generation'
+  [[ "$rollback_from" == "$revision" ]] || fail 'Deployment no longer matches rollback_from. Inspect the current release before requesting another rollback.'
+elif [[ -n "$rollback_from" ]]; then
+  fail 'rollback_from requires rollback: true'
+fi
+
 highest=$(jq -r '.metadata.annotations["x402.incentiv.io/highest-release"] // empty' <<< "$deployment")
 newest=$(jq -r '.metadata.annotations["x402.incentiv.io/newest-release-commit"] // empty' <<< "$deployment")
 

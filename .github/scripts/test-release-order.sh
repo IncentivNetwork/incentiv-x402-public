@@ -25,15 +25,21 @@ next=$(commit next)
 git tag v1.2.0 "$current"
 git checkout -q --detach "$old"
 divergent=$(commit divergent)
+deployment_uid=bc130c06-5ba0-4fb4-91ff-e5c04a283813
+generation=19
 
 check() {
   local scenario=$1 tag=$2 commit=$3 rollback=$4 highest=$5 newest=$6 next_highest=$7 next_newest=${8:-}
-  local deployment result status=0
-  deployment=$(jq -cn --arg highest "$highest" --arg newest "$newest" '{metadata:{annotations:{
+  local rollback_from=${9-} deployment result status=0
+  if [[ "$rollback" == true && $# -lt 9 ]]; then
+    rollback_from="$deployment_uid:$generation"
+  fi
+  deployment=$(jq -cn --arg uid "$deployment_uid" --argjson generation "$generation" \
+    --arg highest "$highest" --arg newest "$newest" '{metadata:{uid:$uid,generation:$generation,annotations:{
     "x402.incentiv.io/highest-release":$highest,
     "x402.incentiv.io/newest-release-commit":$newest
   }}}')
-  result=$(TAG=$tag COMMIT=$commit ROLLBACK=$rollback bash "$validator" <<< "$deployment" 2>&1) || status=$?
+  result=$(TAG=$tag COMMIT=$commit ROLLBACK=$rollback ROLLBACK_FROM=$rollback_from bash "$validator" <<< "$deployment" 2>&1) || status=$?
   if [[ -z "$next_highest" ]]; then
     [[ $status != 0 && "$result" == *'::error::'* ]] || { printf '%s unexpectedly passed\n%s\n' "$scenario" "$result" >&2; return 1; }
   else
@@ -62,3 +68,8 @@ check 'unresolvable legacy annotation' v1.3.0 "$next" false v1.2.1 '' ''
 check 'malformed source annotation' v1.3.0 "$next" false v1.2.0 invalid ''
 check 'explicit rollback to a shared ancestor' v1.0.0 "$old" true v1.2.0 "$divergent" v1.2.0 "$divergent"
 check 'divergent source commit fails even for rollback' v1.0.0 "$divergent" true v1.2.0 "$current" ''
+check 'rollback without an inspected Deployment revision' v1.0.0 "$old" true v1.2.0 "$current" '' '' ''
+check 'queued rollback after a newer Deployment generation' v1.0.0 "$old" true v1.2.0 "$current" '' '' "$deployment_uid:18"
+check 'rollback after Deployment recreation with the same generation' v1.0.0 "$old" true v1.2.0 "$current" '' '' "02c73391-54c5-42e4-83a3-dc4dde4c9ff3:$generation"
+check 'invalid rollback revision' v1.0.0 "$old" true v1.2.0 "$current" '' '' "$deployment_uid"
+check 'rollback revision provided for a regular release' v1.3.0 "$next" false v1.2.0 "$current" '' '' "$deployment_uid:$generation"
