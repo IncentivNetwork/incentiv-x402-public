@@ -7,6 +7,10 @@ on:
         description: Release tag on main (vX.Y.Z)
         required: true
         type: string
+      rollback:
+        description: Allow deploying an older, previously built version
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -60,12 +64,13 @@ jobs:
     environment: prod
     concurrency:
       group: deploy-prod
-      cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       id-token: write # OIDC token for the deployment role; this job only
     env:
       TAG: ${{ needs.release.outputs.tag }}
+      ROLLBACK: ${{ inputs.rollback }}
       AWS_REGION: ${{ vars.AWS_REGION }}
       ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
       EKS_CLUSTER: ${{ vars.EKS_CLUSTER }}
@@ -97,6 +102,10 @@ jobs:
           }
           DIGEST=$(digest)
           if [ -z "$DIGEST" ] || [ "$DIGEST" = None ]; then
+            if [[ "$ROLLBACK" == true ]]; then
+              echo "::error::No existing image for rollback to $TAG"
+              exit 1
+            fi
             aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
             docker build --pull -t "$REGISTRY/$ECR_REPOSITORY:$TAG" .
             docker push "$REGISTRY/$ECR_REPOSITORY:$TAG"
@@ -104,6 +113,10 @@ jobs:
             DIGEST=$(digest)
           else
             echo "$TAG is already built, deploying the existing image"
+          fi
+          if ! [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::ECR did not return a valid image digest for $TAG"
+            exit 1
           fi
           echo "ref=$REGISTRY/$ECR_REPOSITORY@$DIGEST" >> "$GITHUB_OUTPUT"
 
@@ -134,9 +147,28 @@ jobs:
             exit 1
           fi
 
+          HIGHEST=$(jq -r '.metadata.annotations["x402.incentiv.io/highest-release"] // empty' <<< "$LIVE")
+          version='(0|[1-9][0-9]*)'
+          if [[ -n "$HIGHEST" && ! "$HIGHEST" =~ ^v$version\.$version\.$version$ ]]; then
+            echo '::error::Invalid x402.incentiv.io/highest-release annotation on the Deployment'
+            exit 1
+          fi
+          NEXT_HIGHEST=$(printf '%s\n' "$HIGHEST" "$TAG" | LC_ALL=C sort -V | tail -n 1)
+          if [[ "$TAG" != "$NEXT_HIGHEST" && "$ROLLBACK" != true ]]; then
+            echo "::error::$TAG is older than $HIGHEST. Set rollback to true for an intentional downgrade."
+            exit 1
+          fi
+          if [[ "$TAG" == "$NEXT_HIGHEST" && "$ROLLBACK" == true ]]; then
+            echo '::error::A rollback must target a version older than the highest requested release'
+            exit 1
+          fi
+
           # Reject the patch if the Deployment changed after these checks.
-          PATCH=$(jq -c --arg name "$K8S_CONTAINER" --arg image "$IMAGE" '{
-            metadata: {resourceVersion: .metadata.resourceVersion},
+          PATCH=$(jq -c --arg name "$K8S_CONTAINER" --arg image "$IMAGE" --arg highest "$NEXT_HIGHEST" '{
+            metadata: {
+              resourceVersion: .metadata.resourceVersion,
+              annotations: {"x402.incentiv.io/highest-release": $highest}
+            },
             spec: {template: {spec: {containers: [{name: $name, image: $image}]}}}
           }' <<< "$LIVE")
           kubectl -n "$K8S_NAMESPACE" patch "$DEPLOYMENT" --type strategic --patch "$PATCH"

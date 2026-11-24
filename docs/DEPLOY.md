@@ -64,6 +64,8 @@ Protect `main` with PR review and restrict the GitHub `prod` environment to the 
 
 Set `AWS_ROLE_ARN`, `AWS_REGION`, `ECR_REPOSITORY`, `EKS_CLUSTER`, `K8S_NAMESPACE`, `K8S_DEPLOYMENT` and `K8S_CONTAINER` as variables in `prod`. Push a `vX.Y.Z` tag on a commit already on `main`. Run **Deploy facilitator** from `main` in GitHub Actions with that tag, or use `gh workflow run deploy.yml --ref main -f tag=vX.Y.Z`. The workflow tests the tagged commit using the current CI matrix before building or reusing the immutable image and deploying by digest. Tag creation by itself does not start a release.
 
+Production deployments run one at a time. The Deployment annotation `x402.incentiv.io/highest-release` records the highest version requested, even if its rollout fails. Keep that annotation when applying infrastructure changes. If production already uses version tags before adopting this workflow, seed it with the current release tag before the first run. To roll back, select an earlier tag with an existing ECR image and set `rollback` to `true`. Rollback leaves the highest requested version in place, so pending runs for older versions cannot undo it accidentally.
+
 ## Endpoints
 
 | Method and path | Purpose |
