@@ -47,7 +47,7 @@ import { paymentMiddleware } from "@x402/express";
 import { HTTPFacilitatorClient, x402ResourceServer } from "@x402/core/server";
 import { IncentivEoaTxScheme, IncentivUserOpScheme } from "@incentiv/x402";
 
-const NETWORK = "eip155:24101";
+const NETWORK = "eip155:24101" as const;
 const server = new x402ResourceServer(
   new HTTPFacilitatorClient({ url: "https://x402.incentiv.io" }),
 );
@@ -117,7 +117,7 @@ import { withX402 } from "@x402/next";
 import { HTTPFacilitatorClient, x402ResourceServer } from "@x402/core/server";
 import { IncentivEoaTxScheme, IncentivUserOpScheme } from "@incentiv/x402";
 
-const NETWORK = "eip155:24101";
+const NETWORK = "eip155:24101" as const;
 const server = new x402ResourceServer(
   new HTTPFacilitatorClient({ url: "https://x402.incentiv.io" }),
 );
@@ -153,7 +153,7 @@ import { paymentMiddleware } from "@x402/hono";
 import { HTTPFacilitatorClient, x402ResourceServer } from "@x402/core/server";
 import { IncentivEoaTxScheme, IncentivUserOpScheme } from "@incentiv/x402";
 
-const NETWORK = "eip155:24101";
+const NETWORK = "eip155:24101" as const;
 const server = new x402ResourceServer(
   new HTTPFacilitatorClient({ url: "https://x402.incentiv.io" }),
 );
