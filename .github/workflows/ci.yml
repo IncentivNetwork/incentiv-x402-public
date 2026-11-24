@@ -10,7 +10,7 @@ name: CI
 #
 # The deploy job runs in the `prod` environment, which accepts only v* tags and
 # holds the deployment settings as variables (AWS_ROLE_ARN, AWS_REGION,
-# ECR_REPOSITORY, EKS_CLUSTER, K8S_NAMESPACE, K8S_DEPLOYMENT). Its credentials
+# ECR_REPOSITORY, EKS_CLUSTER, K8S_NAMESPACE, K8S_DEPLOYMENT, K8S_CONTAINER). Its credentials
 # can push this image and update this one deployment, nothing else.
 on:
   push:
@@ -67,6 +67,7 @@ jobs:
       EKS_CLUSTER: ${{ vars.EKS_CLUSTER }}
       K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
       K8S_DEPLOYMENT: ${{ vars.K8S_DEPLOYMENT }}
+      K8S_CONTAINER: ${{ vars.K8S_CONTAINER }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -120,9 +121,33 @@ jobs:
           IMAGE: ${{ steps.image.outputs.ref }}
         run: |
           set -euo pipefail
+          : "${K8S_CONTAINER:?Set K8S_CONTAINER to the facilitator container name}"
           aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_REGION" >/dev/null
-          CONTAINER=$(kubectl -n "$K8S_NAMESPACE" get deployment "$K8S_DEPLOYMENT" -o jsonpath='{.spec.template.spec.containers[0].name}')
-          kubectl -n "$K8S_NAMESPACE" set image deployment/"$K8S_DEPLOYMENT" "$CONTAINER=$IMAGE"
-          # One instance, replaced in place: the old one finishes its settles first (up to 70 s).
-          kubectl -n "$K8S_NAMESPACE" rollout status deployment/"$K8S_DEPLOYMENT" --timeout=5m
+          DEPLOYMENT="deployment/$K8S_DEPLOYMENT"
+          LIVE=$(kubectl -n "$K8S_NAMESPACE" get "$DEPLOYMENT" -o json)
+          if ! jq -e '.spec.replicas == 1 and .spec.strategy.type == "Recreate" and (.spec.paused != true)' <<< "$LIVE" >/dev/null; then
+            echo '::error::The Deployment must be active, with one replica and the Recreate strategy'
+            exit 1
+          fi
+          if ! CONTAINER=$(jq -ce --arg name "$K8S_CONTAINER" '.spec.template.spec.containers[] | select(.name == $name)' <<< "$LIVE"); then
+            echo '::error::K8S_CONTAINER does not name a container in the Deployment'
+            exit 1
+          fi
+          GRACE=$(jq '.spec.template.spec.terminationGracePeriodSeconds // 0' <<< "$LIVE")
+          if ! jq -e --argjson grace "$GRACE" '
+            (.lifecycle.stopSignal // "SIGTERM") == "SIGTERM" and
+            (.lifecycle.preStop == null or (.lifecycle.preStop.sleep.seconds | type == "number")) and
+            $grace >= (75 + (.lifecycle.preStop.sleep.seconds // 0))
+          ' <<< "$CONTAINER" >/dev/null; then
+            echo '::error::The facilitator needs SIGTERM and a termination grace period of at least 75 seconds plus any preStop sleep'
+            exit 1
+          fi
+
+          # Reject the patch if the Deployment changed after these checks.
+          PATCH=$(jq -c --arg name "$K8S_CONTAINER" --arg image "$IMAGE" '{
+            metadata: {resourceVersion: .metadata.resourceVersion},
+            spec: {template: {spec: {containers: [{name: $name, image: $image}]}}}
+          }' <<< "$LIVE")
+          kubectl -n "$K8S_NAMESPACE" patch "$DEPLOYMENT" --type strategic --patch "$PATCH"
+          kubectl -n "$K8S_NAMESPACE" rollout status "$DEPLOYMENT" --timeout=5m
           echo "Deployed $GITHUB_REF_NAME" >> "$GITHUB_STEP_SUMMARY"

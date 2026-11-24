@@ -52,6 +52,12 @@ All settings are environment variables. Defaults are Incentiv mainnet.
   | `catalog_rejected`, `catalog_error` | A listing was refused (with the detail, when there is one), or the catalog failed; the settle result is unchanged |
   | `catalog_load_failed`, `catalog_save_failed` | `catalog.json` could not be read (moved to `catalog.json.corrupt-<time>`) or written (retried with backoff; the final write at exit is not retried) |
 
+## Kubernetes on EKS
+
+- Configure the facilitator Deployment in your infrastructure with `replicas: 1` and `strategy.type: Recreate`. Use a persistent volume mounted at the facilitator's data directory and keep autoscaling disabled. A release waits for the old revision to terminate before starting the new one, so plan for a short interruption. During maintenance, avoid deleting a running pod directly: the ReplicaSet can start a replacement before termination finishes. Use a Deployment rollout or scale to zero and confirm the old process has stopped before scaling back up.
+- Use SIGTERM and set `terminationGracePeriodSeconds` to at least 75 in the pod template. If the facilitator has a `preStop` hook, use a Kubernetes `sleep` handler and add its full duration to that minimum. Apply these settings and confirm the running pod uses them before enabling automated releases. Changing a template does not extend the grace period of an existing pod.
+- Set the `prod` environment variable `K8S_CONTAINER` to the facilitator container name. The release workflow checks the Deployment's rollout and shutdown settings before updating that container.
+
 ## Endpoints
 
 | Method and path | Purpose |
