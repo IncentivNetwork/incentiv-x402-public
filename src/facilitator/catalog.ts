@@ -1,10 +1,171 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, open, rm } from "node:fs/promises";
+import { isIP } from "node:net";
 import { basename, dirname, join } from "node:path";
 import { SCHEME } from "../constants.js";
 import { logMessage, logToStderr } from "../decode.js";
 import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
 import { extractDiscoveryInfo, isValidIconUrl, isValidServiceName, sanitizeTags, validateDiscoveryExtensionSpec } from "@x402/extensions/bazaar";
+
+/**
+ * Validates that a resource URL is a safe public HTTPS URL.
+ * Refuses non-https schemes, loopback/private/link-local/unspecified/reserved IP literals,
+ * and localhost or internal/local domains (.localhost, .local, .internal).
+ */
+export function isSafePublicHttpsUrl(rawUrl: string): boolean {
+  if (typeof rawUrl !== "string") return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:") return false;
+  let host = parsed.hostname;
+  if (!host) return false;
+  if (host.startsWith("[") && host.endsWith("]")) {
+    host = host.slice(1, -1);
+  }
+  let lower = host.toLowerCase();
+  while (lower.endsWith(".")) {
+    lower = lower.slice(0, -1);
+  }
+  if (!lower || lower === "localhost" || lower.endsWith(".localhost") || lower.endsWith(".local") || lower.endsWith(".internal")) {
+    return false;
+  }
+  const ipType = isIP(lower);
+  if (ipType === 4) {
+    const parts = lower.split(".").map(Number);
+    if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return false;
+    return !isDisallowedIpv4(parts[0], parts[1], parts[2], parts[3]);
+  }
+  if (ipType === 6) {
+    return !isDisallowedIpv6(lower);
+  }
+  return true;
+}
+
+function isDisallowedIpv4(b0: number, b1: number, b2: number, b3: number): boolean {
+  if (b0 === 0) return true; // 0.0.0.0/8 unspecified
+  if (b0 === 10) return true; // 10.0.0.0/8 private
+  if (b0 === 100 && b1 >= 64 && b1 <= 127) return true; // 100.64.0.0/10 carrier-grade NAT
+  if (b0 === 127) return true; // 127.0.0.0/8 loopback
+  if (b0 === 169 && b1 === 254) return true; // 169.254.0.0/16 link-local
+  if (b0 === 172 && b1 >= 16 && b1 <= 31) return true; // 172.16.0.0/12 private
+  if (b0 === 192 && b1 === 0 && b2 === 0) return true; // 192.0.0.0/24 IETF protocol assignments
+  if (b0 === 192 && b1 === 0 && b2 === 2) return true; // 192.0.2.0/24 TEST-NET-1 documentation
+  if (b0 === 192 && b1 === 168) return true; // 192.168.0.0/16 private
+  if (b0 === 198 && (b1 === 18 || b1 === 19)) return true; // 198.18.0.0/15 benchmarking
+  if (b0 === 198 && b1 === 51 && b2 === 100) return true; // 198.51.100.0/24 TEST-NET-2 documentation
+  if (b0 === 203 && b1 === 0 && b2 === 113) return true; // 203.0.113.0/24 TEST-NET-3 documentation
+  if (b0 >= 224 && b0 <= 239) return true; // 224.0.0.0/4 multicast
+  if (b0 >= 240) return true; // 240.0.0.0/4 reserved / limited broadcast (including 255.255.255.255)
+  return false;
+}
+
+function parseIpv6Words(raw: string): number[] | undefined {
+  let ip = raw;
+  const zoneIdx = ip.indexOf("%");
+  if (zoneIdx !== -1) ip = ip.slice(0, zoneIdx);
+  const parts = ip.split(":");
+  let emptyIdx = -1;
+  const words: number[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i] === "") {
+      if (emptyIdx === -1) emptyIdx = words.length;
+    } else {
+      const val = parseInt(parts[i], 16);
+      if (Number.isNaN(val) || val < 0 || val > 0xffff) return undefined;
+      words.push(val);
+    }
+  }
+  if (emptyIdx !== -1) {
+    const missing = 8 - words.length;
+    if (missing < 0) return undefined;
+    const zeros = new Array(missing).fill(0);
+    words.splice(emptyIdx, 0, ...zeros);
+  }
+  return words.length === 8 ? words : undefined;
+}
+
+function isDisallowedIpv6(raw: string): boolean {
+  const words = parseIpv6Words(raw);
+  if (!words) return true;
+  // Unspecified ::/128
+  if (words.every((w) => w === 0)) return true;
+  // Loopback ::1/128
+  if (words.slice(0, 7).every((w) => w === 0) && words[7] === 1) return true;
+  // IPv4-mapped ::ffff:0:0/96 (RFC 4291 §2.5.5.2)
+  if (words.slice(0, 5).every((w) => w === 0) && words[5] === 0xffff) {
+    const b0 = (words[6] >> 8) & 0xff;
+    const b1 = words[6] & 0xff;
+    const b2 = (words[7] >> 8) & 0xff;
+    const b3 = words[7] & 0xff;
+    return isDisallowedIpv4(b0, b1, b2, b3);
+  }
+  // IPv4-translated / SIIT ::ffff:0:0:0/96 (RFC 2765 / RFC 4291 §2.5.5.1 / RFC 6145)
+  if (words.slice(0, 4).every((w) => w === 0) && words[4] === 0xffff && words[5] === 0) {
+    const b0 = (words[6] >> 8) & 0xff;
+    const b1 = words[6] & 0xff;
+    const b2 = (words[7] >> 8) & 0xff;
+    const b3 = words[7] & 0xff;
+    return isDisallowedIpv4(b0, b1, b2, b3);
+  }
+  // IPv4-compatible ::/96 (deprecated RFC 4291)
+  if (words.slice(0, 6).every((w) => w === 0)) {
+    const b0 = (words[6] >> 8) & 0xff;
+    const b1 = words[6] & 0xff;
+    const b2 = (words[7] >> 8) & 0xff;
+    const b3 = words[7] & 0xff;
+    if (words[6] !== 0 || words[7] > 1) {
+      return isDisallowedIpv4(b0, b1, b2, b3);
+    }
+  }
+  // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052)
+  if (words[0] === 0x0064 && words[1] === 0xff9b && words.slice(2, 6).every((w) => w === 0)) {
+    const b0 = (words[6] >> 8) & 0xff;
+    const b1 = words[6] & 0xff;
+    const b2 = (words[7] >> 8) & 0xff;
+    const b3 = words[7] & 0xff;
+    return isDisallowedIpv4(b0, b1, b2, b3);
+  }
+  // Local-use IPv4/IPv6 translation 64:ff9b:1::/48 (RFC 8215)
+  if (words[0] === 0x0064 && words[1] === 0xff9b && words[2] === 1) return true;
+  // 6to4 encapsulation 2002::/16 (RFC 3056)
+  if (words[0] === 0x2002) {
+    const b0 = (words[1] >> 8) & 0xff;
+    const b1 = words[1] & 0xff;
+    const b2 = (words[2] >> 8) & 0xff;
+    const b3 = words[2] & 0xff;
+    return isDisallowedIpv4(b0, b1, b2, b3);
+  }
+  // Unique local fc00::/7 (fc00::/8 and fd00::/8)
+  if ((words[0] & 0xfe00) === 0xfc00) return true;
+  // Link-local unicast fe80::/10
+  if ((words[0] & 0xffc0) === 0xfe80) return true;
+  // Deprecated site-local unicast fec0::/10 (RFC 3879)
+  if ((words[0] & 0xffc0) === 0xfec0) return true;
+  // Multicast ff00::/8
+  if ((words[0] & 0xff00) === 0xff00) return true;
+  // Discard prefix 100::/64
+  if (words[0] === 0x0100 && words[1] === 0 && words[2] === 0 && words[3] === 0) return true;
+  // Benchmarking 2001:2::/48 (RFC 5180)
+  if (words[0] === 0x2001 && words[1] === 0x0002) return true;
+  // Documentation 2001:db8::/32 (RFC 3849)
+  if (words[0] === 0x2001 && words[1] === 0x0db8) return true;
+  // ORCHID 2001:10::/28 (RFC 4843)
+  if (words[0] === 0x2001 && (words[1] & 0xfff0) === 0x0010) return true;
+  // ORCHIDv2 2001:20::/28 (RFC 7343)
+  if (words[0] === 0x2001 && (words[1] & 0xfff0) === 0x0020) return true;
+  // Teredo 2001::/32 (RFC 4380)
+  if (words[0] === 0x2001 && words[1] === 0) return true;
+  // Documentation 3fff::/20 (RFC 9637)
+  if ((words[0] & 0xfff0) === 0x3ff0) return true;
+  // Only the Global Unicast space 2000::/3 (RFC 4291 §2.4) is allocated for public Internet use;
+  // all other prefixes not matched above are unallocated or reserved.
+  if ((words[0] & 0xe000) !== 0x2000) return true;
+  return false;
+}
 
 /** One catalog entry in the x402 Bazaar discovery format. */
 export interface DiscoveryEntry {
@@ -361,7 +522,7 @@ export class Catalog {
     };
     // resourceUrl is already canonical: the origin plus the route template, when one was declared.
     const url = d.resourceUrl;
-    if (!/^https?:\/\//.test(url) || url.length > CATALOG_LIMITS.maxUrlChars) return rejected("the resource must be an http(s) URL of reasonable length");
+    if (!isSafePublicHttpsUrl(url) || url.length > CATALOG_LIMITS.maxUrlChars) return rejected("the resource must be a public https URL of reasonable length");
 
     // The discovery info comes from the payer's payload, so the key includes who was paid: a payment to another
     // address creates its own entry. Anyone who pays this payTo can still update its entry for this resource.
@@ -856,7 +1017,7 @@ function normalize(e: DiscoveryEntry): DiscoveryEntry | undefined {
   const a = e.accepts?.[0];
   if (!a || typeof e.resource !== "string" || typeof e.lastUpdated !== "string") return undefined;
   if (!ISO_DATE.test(e.lastUpdated) || Number.isNaN(Date.parse(e.lastUpdated))) return undefined;
-  if (!/^https?:\/\//.test(e.resource) || e.resource.length > CATALOG_LIMITS.maxUrlChars) return undefined;
+  if (!isSafePublicHttpsUrl(e.resource) || e.resource.length > CATALOG_LIMITS.maxUrlChars) return undefined;
   const bazaar = (e.extensions as { bazaar?: unknown } | undefined)?.bazaar;
   if (bazaar !== undefined) {
     // The same fixed-shape, http-only rules as a new record, so stored declarations from an earlier version

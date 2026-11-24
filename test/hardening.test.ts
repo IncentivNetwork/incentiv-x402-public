@@ -2849,6 +2849,95 @@ test("EOA payments are sent once per settle: viem does not retry eth_sendRawTran
   }
 });
 
+test("catalog refuses loopback, private, metadata and non-https URLs in record and normalize", () => {
+  const c = new Catalog();
+
+  const rejectedUrls = [
+    "http://localhost:8080/admin",
+    "http://127.0.0.1/x",
+    "http://169.254.169.254/latest/meta-data/",
+    "http://10.0.0.5/internal",
+    "http://[::1]/x",
+    "http://0x7f000001/x",
+    "http://metadata.google.internal/x",
+    "https://localhost:8080/admin",
+    "https://127.0.0.1/x",
+    "https://169.254.169.254/latest/meta-data/",
+    "https://10.0.0.5/internal",
+    "https://[::1]/x",
+    "https://0x7f000001/x",
+    "https://metadata.google.internal/x",
+    "https://foo.localhost/x",
+    "https://device.local/x",
+    "https://backend.internal/x",
+    "https://localhost./x",
+    "https://metadata.google.internal./x",
+    "https://device.local./x",
+    "https://foo.localhost./x",
+    "https://[fe80::1]/x",
+    "https://[fc00::1]/x",
+    "https://[fd12:3456::1]/x",
+    "https://[fec0::1]/x",
+    "https://[::]/x",
+    "https://[::ffff:127.0.0.1]/x",
+    "https://[::ffff:10.0.0.1]/x",
+    "https://[::ffff:192.168.1.1]/x",
+    "https://[::ffff:169.254.1.1]/x",
+    "https://[::ffff:0:127.0.0.1]/x",
+    "https://[::ffff:0:169.254.169.254]/latest/meta-data/",
+    "https://[::ffff:0:10.0.0.1]/internal",
+    "https://[64:ff9b::127.0.0.1]/x",
+    "https://[64:ff9b::169.254.169.254]/x",
+    "https://[64:ff9b:1::a00:1]/x",
+    "https://[2002:7f00:1::1]/x",
+    "https://[2002:a9fe:a9fe::1]/x",
+    "https://[ff02::1]/x",
+    "https://[2001:2::1]/x",
+    "https://[2001:db8::1]/x",
+    "https://[2001:10::1]/x",
+    "https://[2001:20::1]/x",
+    "https://[2001::1]/x",
+    "https://[3fff::1]/x",
+    "https://[4000::1]/x",
+  ];
+
+  for (const u of rejectedUrls) {
+    const res = c.record(payload(u) as never, req());
+    assert.equal(res.status, "rejected", `record should reject ${u}`);
+    assert.equal(res.rejectedReason, "the resource must be a public https URL of reasonable length", `reason for ${u}`);
+  }
+
+  // Valid public HTTPS URLs (including genuine public IPv6) are accepted
+  const accepted = c.record(payload("https://api.example.com/v1") as never, req());
+  assert.equal(accepted.status, "success");
+  const acceptedIpv6 = c.record(payload("https://[2606:4700:4700::1111]/x") as never, req());
+  assert.equal(acceptedIpv6.status, "success");
+  assert.equal(c.list({}).pagination.total, 2);
+
+  // Stored entries with restricted URLs are dropped on load
+  const dir = mkdtempSync(join(tmpdir(), "x402-url-restrictions-"));
+  const path = join(dir, "catalog.json");
+  const file: Record<string, unknown> = {};
+  const makeEntry = (resource: string) => ({
+    resource,
+    type: "http",
+    x402Version: 2,
+    accepts: [req(merchant)],
+    lastUpdated: new Date().toISOString(),
+  });
+
+  for (let i = 0; i < rejectedUrls.length; i++) {
+    const u = rejectedUrls[i]!;
+    file[`GET ${u} eip155:24101 ${merchant.toLowerCase()}`] = makeEntry(u);
+  }
+  file[`GET https://valid.example.com/api eip155:24101 ${merchant.toLowerCase()}`] = makeEntry("https://valid.example.com/api");
+  file[`GET https://[2606:4700:4700::1111]/x eip155:24101 ${merchant.toLowerCase()}`] = makeEntry("https://[2606:4700:4700::1111]/x");
+
+  writeFileSync(path, JSON.stringify(file));
+  const loaded = new Catalog(path);
+  assert.equal(loaded.list({}).pagination.total, 2);
+});
+
 test("nonce refusals are recognized in the usual node wordings", () => {
   for (const m of ["nonce too low", "Nonce too low: next nonce 5, tx nonce 4", "nonce has already been used", "replacement transaction underpriced", "OldNonce", "transaction already imported"]) {
     assert.ok(nonceRefusal(m), m);
