@@ -1,0 +1,153 @@
+name: Deploy facilitator
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag on main (vX.Y.Z)
+        required: true
+        type: string
+      rollback:
+        description: Allow deploying an older version or source commit with a verified image
+        type: boolean
+        default: false
+      rollback_from:
+        description: Expected Deployment UID:generation for a rollback
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Resolve the release tag
+        id: release
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version='(0|[1-9][0-9]*)'
+          if ! [[ "$TAG" =~ ^v$version\.$version\.$version$ && "${#TAG}" -le 128 ]]; then
+            echo '::error::Provide a vX.Y.Z release tag of at most 128 characters'
+            exit 1
+          fi
+          if ! COMMIT=$(git rev-parse --verify "refs/tags/$TAG^{commit}"); then
+            echo "::error::Tag $TAG does not exist or does not point to a commit"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT" "$GITHUB_SHA"; then
+            echo "::error::Tag $TAG must point to a commit on main"
+            exit 1
+          fi
+          # This baseline includes the release blockers and the current settlement store format.
+          baseline=c81d10fe5d3c0c67739bef4154384ef577e73141
+          if ! git merge-base --is-ancestor "$baseline" "$COMMIT"; then
+            echo "::error::Tag $TAG predates the supported facilitator release baseline"
+            exit 1
+          fi
+          printf 'tag=%s\ncommit=%s\n' "$TAG" "$COMMIT" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: release
+    uses: ./.github/workflows/ci.yml
+    with:
+      commit: ${{ needs.release.outputs.commit }}
+
+  deploy:
+    name: Deploy
+    needs: [release, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: prod
+    concurrency:
+      group: deploy-prod
+      queue: max
+    permissions:
+      contents: read
+      id-token: write # OIDC token for the deployment role; this job only
+    env:
+      TAG: ${{ needs.release.outputs.tag }}
+      COMMIT: ${{ needs.release.outputs.commit }}
+      ROLLBACK: ${{ inputs.rollback }}
+      ROLLBACK_FROM: ${{ inputs.rollback_from }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      EKS_CLUSTER: ${{ vars.EKS_CLUSTER }}
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+      K8S_DEPLOYMENT: ${{ vars.K8S_DEPLOYMENT }}
+      K8S_CONTAINER: ${{ vars.K8S_CONTAINER }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release.outputs.commit }}
+          path: release-source
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Publish or verify the release image
+        id: image
+        run: bash .github/scripts/publish-facilitator.sh release-source
+
+      - name: Roll out
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          : "${K8S_CONTAINER:?Set K8S_CONTAINER to the facilitator container name}"
+          aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_REGION" >/dev/null
+          DEPLOYMENT="deployment/$K8S_DEPLOYMENT"
+          LIVE=$(kubectl -n "$K8S_NAMESPACE" get "$DEPLOYMENT" -o json)
+          if ! jq -e '.spec.replicas == 1 and .spec.strategy.type == "Recreate" and (.spec.paused != true)' <<< "$LIVE" >/dev/null; then
+            echo '::error::The Deployment must be active, with one replica and the Recreate strategy'
+            exit 1
+          fi
+          if ! CONTAINER=$(jq -ce --arg name "$K8S_CONTAINER" '.spec.template.spec.containers[] | select(.name == $name)' <<< "$LIVE"); then
+            echo '::error::K8S_CONTAINER does not name a container in the Deployment'
+            exit 1
+          fi
+          if ! jq -e -f .github/scripts/validate-facilitator-readiness.jq <<< "$CONTAINER" >/dev/null; then
+            echo '::error::Configure HTTP readiness on /health at the facilitator PORT with timeoutSeconds of at least 25. Use a literal PORT when supplying envFrom or overriding the default.'
+            exit 1
+          fi
+          GRACE=$(jq '.spec.template.spec.terminationGracePeriodSeconds // 0' <<< "$LIVE")
+          if ! jq -e --argjson grace "$GRACE" '
+            (.lifecycle.stopSignal // "SIGTERM") == "SIGTERM" and
+            (.lifecycle.preStop == null or (.lifecycle.preStop.sleep.seconds | type == "number")) and
+            $grace >= (75 + (.lifecycle.preStop.sleep.seconds // 0))
+          ' <<< "$CONTAINER" >/dev/null; then
+            echo '::error::The facilitator needs SIGTERM and a termination grace period of at least 75 seconds plus any preStop sleep'
+            exit 1
+          fi
+
+          ORDER=$(bash .github/scripts/check-release-order.sh <<< "$LIVE")
+
+          # Reject the patch if the Deployment changed after these checks.
+          PATCH=$(jq -c --arg name "$K8S_CONTAINER" --arg image "$IMAGE" --argjson order "$ORDER" '{
+            metadata: {resourceVersion: .metadata.resourceVersion, annotations: $order},
+            spec: {template: {spec: {containers: [{name: $name, image: $image}]}}}
+          }' <<< "$LIVE")
+          kubectl -n "$K8S_NAMESPACE" patch "$DEPLOYMENT" --type strategic --patch "$PATCH"
+          kubectl -n "$K8S_NAMESPACE" rollout status "$DEPLOYMENT" --timeout=5m
+          echo "Deployed $TAG" >> "$GITHUB_STEP_SUMMARY"
