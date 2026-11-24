@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seller quickstart | x402 on Incentiv</title>
+<meta name="description" content="Protect an API route with x402 and get paid in USDC on Incentiv.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231f5eff'/%3E%3Ctext x='16' y='22' font-size='16' font-family='sans-serif' font-weight='700' text-anchor='middle' fill='white'%3E402%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top"><div class="bar">
+  <a class="brand" href="/">x402 on Incentiv</a>
+  <nav>
+    <a href="/docs/">Overview</a>
+    <a href="/docs/sellers" aria-current="page">Sell</a>
+    <a href="/docs/buyers">Buy</a>
+    <a href="/docs/api">API</a>
+    <a href="/docs/self-host">Run a facilitator</a>
+    <a href="https://github.com/IncentivNetwork/incentiv-x402-public">GitHub</a>
+  </nav>
+</div></header>
+<main class="doc">
+  <h1>Seller quickstart</h1>
+  <p class="lead">Protect an Express route and receive USDC on Incentiv.</p>
+
+  <h2>Prerequisites</h2>
+  <table>
+    <tr><th>Requirement</th><th>Notes</th></tr>
+    <tr><td>An Incentiv address</td><td>It receives the USDC</td></tr>
+    <tr><td>Node.js 22.18 or later</td><td></td></tr>
+    <tr><td>An API to protect</td><td>Express, Next.js or Hono</td></tr>
+  </table>
+
+  <h2>Steps</h2>
+
+  <ol class="steps">
+    <li>
+      <strong>Install.</strong>
+      <pre><code>npm install @incentiv/x402</code></pre>
+      <p>It brings <code>@x402/core</code>, <code>@x402/express</code>, <code>@x402/extensions</code> and <code>@x402/fetch</code> with it.</p>
+    </li>
+    <li>
+      <strong>Protect a route.</strong> Point the resource server at the public facilitator and register both schemes.
+<pre><code>import express from "express";
+import { paymentMiddleware } from "@x402/express";
+import { HTTPFacilitatorClient, x402ResourceServer } from "@x402/core/server";
+import { IncentivEoaTxScheme, IncentivUserOpScheme } from "@incentiv/x402";
+
+const NETWORK = "eip155:24101";
+const server = new x402ResourceServer(
+  new HTTPFacilitatorClient({ url: "https://x402.incentiv.io" }),
+);
+server.register(NETWORK, new IncentivEoaTxScheme());
+server.register(NETWORK, new IncentivUserOpScheme());
+
+const pay = (scheme: string) => ({
+  scheme,
+  network: NETWORK,
+  payTo: "0xYourIncentivAddress",
+  price: "$0.01",
+  maxTimeoutSeconds: 120,
+});
+
+const app = express();
+app.use(
+  paymentMiddleware(
+    {
+      "GET /weather": {
+        accepts: [pay("incentiv-eoa-tx"), pay("incentiv-userop")],
+        description: "Current weather",
+        mimeType: "application/json",
+      },
+    },
+    server,
+  ),
+);
+app.get("/weather", (_req, res) =&gt; res.json({ city: "Kyiv", tempC: 21 }));
+app.listen(4021);</code></pre>
+    </li>
+    <li>
+      <strong>Test the 402 response.</strong>
+<pre><code>curl -i http://localhost:4021/weather</code></pre>
+      <p>You should get <code>HTTP 402</code> with a <code>PAYMENT-REQUIRED</code> header. It is base64 JSON that lists the price and the schemes you accept.</p>
+    </li>
+    <li>
+      <strong>Test the facilitator.</strong>
+<pre><code>curl https://x402.incentiv.io/health
+curl https://x402.incentiv.io/supported</code></pre>
+    </li>
+    <li>
+      <strong>Test a paid request.</strong> Use the <a href="/docs/buyers">buyer quickstart</a> with a small amount of USDC and a little CENT.
+    </li>
+  </ol>
+
+  <h2>Options</h2>
+  <table>
+    <tr><th>Setting</th><th>Rule</th></tr>
+    <tr><td><code>scheme</code></td><td>Offer one or both: <code>incentiv-eoa-tx</code>, <code>incentiv-userop</code>. A buyer pays with the first one it supports.</td></tr>
+    <tr><td><code>price</code></td><td>In USD, paid in USDC.</td></tr>
+    <tr><td><code>payTo</code></td><td>Your Incentiv address. The facilitator never holds the funds.</td></tr>
+    <tr><td><code>maxTimeoutSeconds</code></td><td>Capped at 300. 120 is a good default.</td></tr>
+    <tr><td><code>extra.paymentFlow</code></td><td>Set <code>"upfront"</code> on each payment option for routes that do expensive work or have side effects.</td></tr>
+  </table>
+  <div class="note warn">
+    <strong>Serve only after settlement.</strong> By default the handler can start before settlement finishes. With <code>paymentFlow: "upfront"</code>, the payment settles before the handler starts, and a later handler failure does not refund it.
+  </div>
+
+  <h2>Other frameworks</h2>
+  <p>The resource server and the payment options are the same as in the Express example.</p>
+
+  <h3>Next.js</h3>
+  <pre><code>npm install @incentiv/x402 @x402/next</code></pre>
+  <p><code>app/api/weather/route.ts</code>:</p>
+<pre><code>import { NextRequest, NextResponse } from "next/server";
+import { withX402 } from "@x402/next";
+import { HTTPFacilitatorClient, x402ResourceServer } from "@x402/core/server";
+import { IncentivEoaTxScheme, IncentivUserOpScheme } from "@incentiv/x402";
+
+const NETWORK = "eip155:24101";
+const server = new x402ResourceServer(
+  new HTTPFacilitatorClient({ url: "https://x402.incentiv.io" }),
+);
+server.register(NETWORK, new IncentivEoaTxScheme());
+server.register(NETWORK, new IncentivUserOpScheme());
+
+const pay = (scheme: string) =&gt; ({
+  scheme,
+  network: NETWORK,
+  payTo: "0xYourIncentivAddress",
+  price: "$0.01",
+  maxTimeoutSeconds: 120,
+});
+
+const handler = async (_req: NextRequest) =&gt;
+  NextResponse.json({ city: "Kyiv", tempC: 21 });
+
+export const GET = withX402(
+  handler,
+  {
+    accepts: [pay("incentiv-eoa-tx"), pay("incentiv-userop")],
+    description: "Current weather",
+    mimeType: "application/json",
+  },
+  server,
+);</code></pre>
+
+  <h3>Hono</h3>
+  <pre><code>npm install @incentiv/x402 @x402/hono hono @hono/node-server</code></pre>
+<pre><code>import { Hono } from "hono";
+import { serve } from "@hono/node-server";
+import { paymentMiddleware } from "@x402/hono";
+import { HTTPFacilitatorClient, x402ResourceServer } from "@x402/core/server";
+import { IncentivEoaTxScheme, IncentivUserOpScheme } from "@incentiv/x402";
+
+const NETWORK = "eip155:24101";
+const server = new x402ResourceServer(
+  new HTTPFacilitatorClient({ url: "https://x402.incentiv.io" }),
+);
+server.register(NETWORK, new IncentivEoaTxScheme());
+server.register(NETWORK, new IncentivUserOpScheme());
+
+const pay = (scheme: string) =&gt; ({
+  scheme,
+  network: NETWORK,
+  payTo: "0xYourIncentivAddress",
+  price: "$0.01",
+  maxTimeoutSeconds: 120,
+});
+
+const app = new Hono();
+app.use(
+  paymentMiddleware(
+    {
+      "GET /weather": {
+        accepts: [pay("incentiv-eoa-tx"), pay("incentiv-userop")],
+        description: "Current weather",
+        mimeType: "application/json",
+      },
+    },
+    server,
+  ),
+);
+app.get("/weather", (c) =&gt; c.json({ city: "Kyiv", tempC: 21 }));
+serve({ fetch: app.fetch, port: 4021 });</code></pre>
+
+  <h2>Discovery (optional)</h2>
+  <p>Declare discovery info, and a facilitator that runs with discovery on catalogs the route after its first paid request. Agents then find it through <code>/discovery/resources</code> and <code>/discovery/search</code>. No registration is needed. A facilitator that offers discovery lists <code>bazaar</code> under <code>extensions</code> in its <code>/supported</code> answer; check <a href="https://x402.incentiv.io/supported"><code>/supported</code></a> to see whether the public one does.</p>
+<pre><code>import { bazaarResourceServerExtension, declareDiscoveryExtension } from "@x402/extensions/bazaar";
+
+server.registerExtension(bazaarResourceServerExtension);
+// in the route config:
+//   serviceName: "Example Weather",
+//   tags: ["weather"],
+//   extensions: { ...declareDiscoveryExtension({ output: { example: { city: "Kyiv", tempC: 21 } } }) },</code></pre>
+  <p>The merchant sees the outcome in the facilitator's <code>EXTENSION-RESPONSES</code> header: <code>bazaar.status</code> is <code>success</code> or <code>rejected</code>.</p>
+
+  <h2>Errors</h2>
+  <p>The facilitator answers HTTP 200 with a reason code, for example <code>insufficient_funds</code>, <code>payment_expired</code> or <code>settle_timeout</code>. After <code>settle_timeout</code>, retry the same payload. See the <a href="/docs/api#reason-codes">reason codes</a>.</p>
+</main>
+<footer><div class="bar">
+  <span>MIT licensed</span>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public">Source</a>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/docs/SPEC.md">Protocol spec</a>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/SECURITY.md">Security</a>
+</div></footer>
+</body>
+</html>

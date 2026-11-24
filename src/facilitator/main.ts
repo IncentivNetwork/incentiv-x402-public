@@ -3,6 +3,7 @@ import { MAINNET, type IncentivConfig } from "../constants.js";
 import { createFacilitatorApp } from "./app.js";
 import { Catalog } from "./catalog.js";
 import { FileStore } from "./store.js";
+import { siteRouter } from "./site.js";
 import { logMessage } from "../decode.js";
 
 // Configuration is read from the environment so the same image runs anywhere.
@@ -56,6 +57,10 @@ const { app } = createFacilitatorApp({
   discoveryPerMinute: intEnv("DISCOVERY_PER_MINUTE"),
   log,
 });
+// The landing page and docs come after the API routes, so they can never shadow an endpoint.
+const site = siteRouter();
+if (site) app.use(site);
+else log({ event: "site_missing", note: "no site directory; / and /docs answer 404" });
 // A path the service does not serve answers JSON like every other answer, not Express's HTML page; with discovery
 // off, that includes /discovery/*. It is added here rather than in createFacilitatorApp, so an app that adds routes
 // to the facilitator app, or mounts it, still reaches its own routes.
