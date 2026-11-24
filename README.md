@@ -27,7 +27,7 @@ import { paymentMiddleware } from "@x402/express";
 import { HTTPFacilitatorClient, x402ResourceServer } from "@x402/core/server";
 import { IncentivEoaTxScheme, IncentivUserOpScheme } from "@incentiv/x402";
 
-const NETWORK = "eip155:24101";
+const NETWORK = "eip155:24101" as const;
 const server = new x402ResourceServer(new HTTPFacilitatorClient({ url: process.env.FACILITATOR_URL }));
 server.register(NETWORK, new IncentivEoaTxScheme());
 server.register(NETWORK, new IncentivUserOpScheme());
