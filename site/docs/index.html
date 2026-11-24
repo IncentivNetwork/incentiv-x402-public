@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overview | x402 on Incentiv</title>
+<meta name="description" content="How x402 payments work on Incentiv: schemes, roles, and what you need to start.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231f5eff'/%3E%3Ctext x='16' y='22' font-size='16' font-family='sans-serif' font-weight='700' text-anchor='middle' fill='white'%3E402%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top"><div class="bar">
+  <a class="brand" href="/">x402 on Incentiv</a>
+  <nav>
+    <a href="/docs/" aria-current="page">Overview</a>
+    <a href="/docs/sellers">Sell</a>
+    <a href="/docs/buyers">Buy</a>
+    <a href="/docs/api">API</a>
+    <a href="/docs/self-host">Run a facilitator</a>
+    <a href="https://github.com/IncentivNetwork/incentiv-x402-public">GitHub</a>
+  </nav>
+</div></header>
+<main class="doc">
+  <h1>Overview</h1>
+  <p class="lead"><code>@incentiv/x402</code> adds two payment schemes for Incentiv (<code>eip155:24101</code>) to the stock <code>@x402</code> packages, and includes the facilitator that verifies and settles them.</p>
+
+  <h2>Roles</h2>
+  <table>
+    <tr><th>Role</th><th>Does</th><th>Uses</th></tr>
+    <tr><td>Seller (resource server)</td><td>Answers <code>402</code> with a price, and serves the content after settlement</td><td><code>@x402/express</code>, <code>@x402/next</code> or <code>@x402/hono</code>, plus <code>IncentivEoaTxScheme</code> and <code>IncentivUserOpScheme</code></td></tr>
+    <tr><td>Buyer (client, agent)</td><td>Signs the quoted payment and retries the request</td><td><code>@x402/fetch</code> or <code>@x402/axios</code>, plus <code>IncentivEoaTxClientScheme</code> or <code>IncentivUserOpClientScheme</code></td></tr>
+    <tr><td>Facilitator</td><td>Verifies the signed payment, submits it to the chain, reports the result</td><td><code>https://x402.incentiv.io</code>, or your own</td></tr>
+  </table>
+
+  <h2>Schemes</h2>
+  <table>
+    <tr><th>Scheme</th><th>Payer</th><th>Payment</th><th>Gas</th></tr>
+    <tr><td><code>incentiv-eoa-tx</code></td><td>A plain wallet (EOA)</td><td>A signed USDC transfer</td><td>Paid by the payer in CENT</td></tr>
+    <tr><td><code>incentiv-userop</code></td><td>An Incentiv smart account</td><td>A signed ERC-4337 user operation</td><td>Paid by the payer in USDC through the Unified Token Paymaster, or in CENT from the account</td></tr>
+  </table>
+  <ul>
+    <li>A seller can offer one or both. A buyer pays with the first one it supports.</li>
+    <li>An EOA can have one payment settling at a time. A smart account can have many in flight, because each payment uses its own nonce lane.</li>
+  </ul>
+
+  <h2>Costs</h2>
+  <p>The facilitator charges nothing. The buyer pays gas on top of the price. On 2026-11-19, a payment cost about 2 CENT of gas from an EOA, or about 0.03 USDC through the paymaster, whose minimum is 0.026 USDC.</p>
+
+  <h2>Limitations</h2>
+  <ul>
+    <li>These are custom schemes. Clients without <code>@incentiv/x402</code> cannot pay, and stock <code>exact</code> clients do not recognise them.</li>
+    <li>Expiry is enforced by the facilitator, not the chain. A signed payment that is never settled stays valid on chain until its nonce is used. A payer can cancel it; see the <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/docs/SPEC.md#6-cancellation">spec</a>.</li>
+    <li>Incentiv has no testnet. Test with small amounts on mainnet.</li>
+  </ul>
+
+  <h2>Next</h2>
+  <ul>
+    <li><a href="/docs/sellers">Seller quickstart</a></li>
+    <li><a href="/docs/buyers">Buyer quickstart</a></li>
+    <li><a href="/docs/api">Facilitator API reference</a></li>
+    <li><a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/docs/SPEC.md">Protocol specification</a></li>
+  </ul>
+</main>
+<footer><div class="bar">
+  <span>MIT licensed</span>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public">Source</a>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/docs/SPEC.md">Protocol spec</a>
+  <a href="https://github.com/IncentivNetwork/incentiv-x402-public/blob/main/SECURITY.md">Security</a>
+</div></footer>
+</body>
+</html>
